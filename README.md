@@ -1,4 +1,5 @@
 # openvpn-install
+[![](https://github.com/vpn-wiki/openvpn-install/blob/master/vpn-wiki/clever-vpn.png)](https://www.clever-vpn.net)
 
 ![Test](https://github.com/angristan/openvpn-install/workflows/Test/badge.svg)
 ![Lint](https://github.com/angristan/openvpn-install/workflows/Lint/badge.svg)
