@@ -1,4 +1,5 @@
 # FAQ
+[![](https://github.com/vpn-wiki/openvpn-install/blob/master/vpn-wiki/clever-vpn.png)](https://www.clever-vpn.net)
 
 **Q:** The script has been updated since I installed OpenVPN. How do I update?
 

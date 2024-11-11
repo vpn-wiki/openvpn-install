@@ -1,4 +1,5 @@
 <!---
+[![](https://github.com/vpn-wiki/openvpn-install/blob/master/vpn-wiki/clever-vpn.png)](https://www.clever-vpn.net)
 ❗️ Please read ❗️
 ➡️ Please make sure you've followed the guidelines: https://github.com/angristan/openvpn-install#contributing
 ✅ Please make sure your changes are tested and working
