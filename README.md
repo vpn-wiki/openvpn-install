@@ -53,6 +53,7 @@ When OpenVPN is installed, you can run the script again, and you will get the ch
 
 - Add a client
 - Remove a client
+- Renew certificates (client or server)
 - Uninstall OpenVPN
 
 In your home directory, you will have `.ovpn` files. These are the client configuration files. Download them from your server and connect using your favorite OpenVPN client.
@@ -88,6 +89,9 @@ If you want to customise your installation, you can export them or specify them 
 - `CUSTOMIZE_ENC=n`
 - `CLIENT=clientname`
 - `PASS=1`
+- `MULTI_CLIENT=n`
+- `CLIENT_CERT_DURATION_DAYS=3650`
+- `SERVER_CERT_DURATION_DAYS=3650`
 
 If the server is behind NAT, you can specify its endpoint with the `ENDPOINT` variable. If the endpoint is the public IP address which it is behind, you can use `ENDPOINT=$(curl -4 ifconfig.co)` (the script will default to this). The endpoint can be an IPv4 or a domain.
 
@@ -114,6 +118,8 @@ export PASS="1"
 ## Features
 
 - Installs and configures a ready-to-use OpenVPN server
+- Certificate renewal for both client and server certificates
+- Uses [official OpenVPN repositories](https://community.openvpn.net/openvpn/wiki/OpenvpnSoftwareRepos) when possible for the latest stable releases
 - Iptables rules and forwarding managed in a seamless way
 - If needed, the script can cleanly remove OpenVPN, including configuration and iptables rules
 - Customisable encryption settings, enhanced default settings (see [Security and Encryption](#security-and-encryption) below)
@@ -127,32 +133,29 @@ export PASS="1"
 - Block DNS leaks on Windows 10
 - Randomised server certificate name
 - Choice to protect clients with a password (private key encryption)
+- Option to allow multiple devices to use the same client profile simultaneously
 - Many other little things!
 
 ## Compatibility
 
 The script supports these Linux distributions:
 
-|                        | Support |
-| ---------------------- | ------- |
-| AlmaLinux 8            | ✅      |
-| Amazon Linux 2         | ✅      |
-| Amazon Linux >= 2023.6 | ✅      |
-| Arch Linux             | ✅      |
-| CentOS 7               | ✅      |
-| CentOS Stream >= 8     | ✅ 🤖   |
-| Debian >= 10           | ✅ 🤖   |
-| Fedora >= 35           | ✅ 🤖   |
-| Oracle Linux 8         | ✅      |
-| Rocky Linux 8          | ✅      |
-| Ubuntu >= 18.04        | ✅ 🤖   |
+|                    | Support |
+| ------------------ | ------- |
+| AlmaLinux >= 8     | ✅ 🤖   |
+| Amazon Linux 2023  | ✅ 🤖   |
+| Arch Linux         | ✅ 🤖   |
+| CentOS Stream >= 8 | ✅ 🤖   |
+| Debian >= 11       | ✅ 🤖   |
+| Fedora >= 40       | ✅ 🤖   |
+| Oracle Linux >= 8  | ✅ 🤖   |
+| Rocky Linux >= 8   | ✅ 🤖   |
+| Ubuntu >= 18.04    | ✅ 🤖   |
 
 To be noted:
 
 - The script is regularly tested against the distributions marked with a 🤖 only.
   - It's only tested on `amd64` architecture.
-- It should work on older versions such as Debian 8+, Ubuntu 16.04+ and previous Fedora releases. But versions not in the table above are not officially supported.
-  - It should also support versions between the LTS versions, but these are not tested.
 - The script requires `systemd`.
 
 ## Fork
@@ -201,13 +204,6 @@ More Q&A in [FAQ.md](FAQ.md).
 
 More Q&A in [FAQ.md](FAQ.md).
 
-## One-stop solutions for public cloud
-
-Solutions that provision a ready to use OpenVPN server based on this script in one go are available for:
-
-- AWS using Terraform at [`openvpn-terraform-install`](https://github.com/dumrauf/openvpn-terraform-install)
-- Terraform AWS module [`openvpn-ephemeral`](https://registry.terraform.io/modules/paulmarsicloud/openvpn-ephemeral/aws/latest)
-
 ## Contributing
 
 ## Discuss changes
@@ -216,12 +212,12 @@ Please open an issue before submitting a PR if you want to discuss a change, esp
 
 ### Code formatting
 
-We use [shellcheck](https://github.com/koalaman/shellcheck) and [shfmt](https://github.com/mvdan/sh) to enforce bash styling guidelines and good practices. They are executed for each commit / PR with GitHub Actions, so you can check the configuration [here](https://github.com/angristan/openvpn-install/blob/master/.github/workflows/push.yml).
+We use [shellcheck](https://github.com/koalaman/shellcheck) and [shfmt](https://github.com/mvdan/sh) to enforce bash styling guidelines and good practices. They are executed for each commit / PR with GitHub Actions, so you can check the configuration [here](https://github.com/angristan/openvpn-install/blob/master/.github/workflows/lint.yml).
 
 ## Security and Encryption
 
-> **Warning**
-> This has not been updated for OpenVPN 2.5 and later.
+> **Note**
+> This section covers security features for OpenVPN 2.4+. OpenVPN 2.5+ introduced additional features like TLS 1.3 support, but this script maintains TLS 1.2 as the minimum for broader client compatibility.
 
 OpenVPN's default settings are pretty weak regarding encryption. This script aims to improve that.
 
@@ -279,6 +275,8 @@ AES-256 is 40% slower than AES-128, and there isn't any real reason to use a 256
 
 AES-GCM is an [AEAD cipher](https://en.wikipedia.org/wiki/Authenticated_encryption) which means it simultaneously provides confidentiality, integrity, and authenticity assurances on the data.
 
+ChaCha20-Poly1305 is another AEAD cipher that provides similar security to AES-GCM. It is particularly useful on devices without hardware AES acceleration (AES-NI), such as older CPUs and many ARM-based devices, where it can be significantly faster than AES.
+
 The script supports the following ciphers:
 
 - `AES-128-GCM`
@@ -287,6 +285,7 @@ The script supports the following ciphers:
 - `AES-128-CBC`
 - `AES-192-CBC`
 - `AES-256-CBC`
+- `CHACHA20-POLY1305` (requires OpenVPN 2.5+)
 
 And defaults to `AES-128-GCM`.
 
@@ -301,9 +300,11 @@ The script proposes the following options, depending on the certificate:
 - ECDSA:
   - `TLS-ECDHE-ECDSA-WITH-AES-128-GCM-SHA256`
   - `TLS-ECDHE-ECDSA-WITH-AES-256-GCM-SHA384`
+  - `TLS-ECDHE-ECDSA-WITH-CHACHA20-POLY1305-SHA256` (requires OpenVPN 2.5+)
 - RSA:
   - `TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256`
   - `TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384`
+  - `TLS-ECDHE-RSA-WITH-CHACHA20-POLY1305-SHA256` (requires OpenVPN 2.5+)
 
 It defaults to `TLS-ECDHE-*-WITH-AES-128-GCM-SHA256`.
 
@@ -361,6 +362,26 @@ So both provide an additional layer of security and mitigate DoS attacks. They a
 `tls-crypt` is an OpenVPN 2.4 feature that provides encryption in addition to authentication (unlike `tls-auth`). It is more privacy-friendly.
 
 The script supports both and uses `tls-crypt` by default.
+
+### Data Channel Offload (DCO)
+
+[Data Channel Offload](https://openvpn.net/as-docs/openvpn-data-channel-offload.html) (DCO) is a kernel acceleration feature that significantly improves OpenVPN performance by keeping data channel encryption/decryption in kernel space, eliminating costly context switches between user and kernel space for each packet.
+
+DCO was merged into the Linux kernel 6.16 (April 2025).
+
+**Requirements:**
+
+- OpenVPN 2.6.0 or later
+- Linux kernel 6.16+ (built-in) or `ovpn-dco` kernel module
+- UDP protocol (TCP is not supported)
+- AEAD cipher (`AES-128-GCM`, `AES-256-GCM`, or `CHACHA20-POLY1305`)
+- Compression disabled
+
+The script's default settings (AES-128-GCM, UDP, no compression) are DCO-compatible. When DCO is available and the configuration is compatible, OpenVPN will automatically use it for improved performance.
+
+**Note:** DCO must be supported on both the server and the client for full acceleration. Client support is available in OpenVPN 2.6+ (Linux, Windows, FreeBSD) and OpenVPN Connect 3.4+ (Windows). macOS does not currently support DCO, but clients can still connect to DCO-enabled servers with partial performance benefits on the server-side.
+
+The script will display the DCO availability status during installation.
 
 ## Say thanks
 
