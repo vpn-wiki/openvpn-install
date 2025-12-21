@@ -3,7 +3,7 @@
 # Run the full test suite
 test: test-build test-up
 	@echo "Waiting for tests to complete..."
-	@for i in $$(seq 1 60); do \
+	@for i in $$(seq 1 180); do \
 		if docker logs openvpn-client 2>&1 | grep -q "ALL TESTS PASSED"; then \
 			echo "✓ Tests passed!"; \
 			$(MAKE) test-down; \
@@ -15,7 +15,7 @@ test: test-build test-up
 			$(MAKE) test-down; \
 			exit 1; \
 		fi; \
-		echo "Waiting... ($$i/60)"; \
+		echo "Waiting... ($$i/180)"; \
 		sleep 2; \
 	done; \
 	echo "Timeout waiting for tests"; \
@@ -111,6 +111,12 @@ test-arch:
 test-centos-stream-9:
 	$(MAKE) test BASE_IMAGE=quay.io/centos/centos:stream9
 
+test-opensuse-leap:
+	$(MAKE) test BASE_IMAGE=opensuse/leap:16.0
+
+test-opensuse-tumbleweed:
+	$(MAKE) test BASE_IMAGE=opensuse/tumbleweed
+
 # Test all distributions (runs sequentially)
 test-all:
 	$(MAKE) test-ubuntu-18.04
@@ -130,3 +136,5 @@ test-all:
 	$(MAKE) test-amazon-2023
 	$(MAKE) test-arch
 	$(MAKE) test-centos-stream-9
+	$(MAKE) test-opensuse-leap
+	$(MAKE) test-opensuse-tumbleweed

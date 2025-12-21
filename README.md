@@ -1,15 +1,11 @@
 # openvpn-install
 [![](https://github.com/vpn-wiki/openvpn-install/blob/master/vpn-wiki/clever-vpn.png)](https://www.clever-vpn.net)
 
-![Test](https://github.com/angristan/openvpn-install/workflows/Test/badge.svg)
-![Lint](https://github.com/angristan/openvpn-install/workflows/Lint/badge.svg)
 [![Say Thanks!](https://img.shields.io/badge/Say%20Thanks-!-1EAEDB.svg)](https://saythanks.io/to/angristan)
 
-OpenVPN installer for Debian, Ubuntu, Fedora, CentOS, Arch Linux, Oracle Linux, Rocky Linux and AlmaLinux.
+OpenVPN installer for Debian, Ubuntu, Fedora, openSUSE, CentOS, Amazon Linux, Arch Linux, Oracle Linux, Rocky Linux and AlmaLinux.
 
-This script will let you setup your own secure VPN server in just a few seconds.
-
-You can also check out [wireguard-install](https://github.com/angristan/wireguard-install), a simple installer for a simpler, safer, faster and more modern VPN protocol.
+This script will let you setup and manage your own secure VPN server in just a few seconds.
 
 ## What is this?
 
@@ -30,133 +26,345 @@ graph LR
   VPN --> I[Internet]
 ```
 
-## Usage
+## Why OpenVPN?
 
-First, get the script and make it executable:
+OpenVPN was the de facto standard for open-source VPNs when this script was created. WireGuard came later and is simpler and faster for most use cases. Check out [wireguard-install](https://github.com/angristan/wireguard-install).
 
-```bash
-curl -O https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh
-chmod +x openvpn-install.sh
-```
+That said, OpenVPN still makes sense when you need:
 
-Then run it:
-
-```sh
-./openvpn-install.sh
-```
-
-You need to run the script as root and have the TUN module enabled.
-
-The first time you run it, you'll have to follow the assistant and answer a few questions to setup your VPN server.
-
-When OpenVPN is installed, you can run the script again, and you will get the choice to:
-
-- Add a client
-- Remove a client
-- Renew certificates (client or server)
-- Uninstall OpenVPN
-
-In your home directory, you will have `.ovpn` files. These are the client configuration files. Download them from your server and connect using your favorite OpenVPN client.
-
-If you have any question, head to the [FAQ](#faq) first. And if you need help, you can open a [discussion](https://github.com/angristan/openvpn-install/discussions). Please search existing issues and dicussions first.
-
-### Headless install
-
-It's also possible to run the script headless, e.g. without waiting for user input, in an automated manner.
-
-Example usage:
-
-```bash
-AUTO_INSTALL=y ./openvpn-install.sh
-
-# or
-
-export AUTO_INSTALL=y
-./openvpn-install.sh
-```
-
-A default set of variables will then be set, by passing the need for user input.
-
-If you want to customise your installation, you can export them or specify them on the same line, as shown above.
-
-- `APPROVE_INSTALL=y`
-- `APPROVE_IP=y`
-- `IPV6_SUPPORT=n`
-- `PORT_CHOICE=1`
-- `PROTOCOL_CHOICE=1`
-- `DNS=1`
-- `COMPRESSION_ENABLED=n`
-- `CUSTOMIZE_ENC=n`
-- `CLIENT=clientname`
-- `PASS=1`
-- `MULTI_CLIENT=n`
-- `CLIENT_CERT_DURATION_DAYS=3650`
-- `SERVER_CERT_DURATION_DAYS=3650`
-
-If the server is behind NAT, you can specify its endpoint with the `ENDPOINT` variable. If the endpoint is the public IP address which it is behind, you can use `ENDPOINT=$(curl -4 ifconfig.co)` (the script will default to this). The endpoint can be an IPv4 or a domain.
-
-Other variables can be set depending on your choice (encryption, compression). You can search for them in the `installQuestions()` function of the script.
-
-Password-protected clients are not supported by the headless installation method since user input is expected by Easy-RSA.
-
-The headless install is more-or-less idempotent, in that it has been made safe to run multiple times with the same parameters, e.g. by a state provisioner like Ansible/Terraform/Salt/Chef/Puppet. It will only install and regenerate the Easy-RSA PKI if it doesn't already exist, and it will only install OpenVPN and other upstream dependencies if OpenVPN isn't already installed. It will recreate all local config and re-generate the client file on each headless run.
-
-### Headless User Addition
-
-It's also possible to automate the addition of a new user. Here, the key is to provide the (string) value of the `MENU_OPTION` variable along with the remaining mandatory variables before invoking the script.
-
-The following Bash script adds a new user `foo` to an existing OpenVPN configuration
-
-```bash
-#!/bin/bash
-export MENU_OPTION="1"
-export CLIENT="foo"
-export PASS="1"
-./openvpn-install.sh
-```
+- **TCP support**: works in restrictive environments where UDP is blocked (corporate networks, airports, hotels, etc.)
+- **Password-protected private keys**: WireGuard configs store the private key in plain text
+- **Legacy compatibility**: clients exist for pretty much every platform, including older systems
 
 ## Features
 
 - Installs and configures a ready-to-use OpenVPN server
+- CLI interface for automation and scripting (non-interactive mode with JSON output)
 - Certificate renewal for both client and server certificates
+- List and monitor connected clients
+- Immediate client disconnect on certificate revocation (via management interface)
 - Uses [official OpenVPN repositories](https://community.openvpn.net/openvpn/wiki/OpenvpnSoftwareRepos) when possible for the latest stable releases
-- Iptables rules and forwarding managed in a seamless way
-- If needed, the script can cleanly remove OpenVPN, including configuration and iptables rules
+- Firewall rules and forwarding managed seamlessly (native firewalld and nftables support, iptables fallback)
+- Configurable VPN subnets (IPv4: default `10.8.0.0/24`, IPv6: default `fd42:42:42:42::/112`)
+- Configurable tunnel MTU (default: `1500`)
+- If needed, the script can cleanly remove OpenVPN, including configuration and firewall rules
 - Customisable encryption settings, enhanced default settings (see [Security and Encryption](#security-and-encryption) below)
-- OpenVPN 2.4 features, mainly encryption improvements (see [Security and Encryption](#security-and-encryption) below)
+- Uses latest OpenVPN features when available (see [Security and Encryption](#security-and-encryption) below)
 - Variety of DNS resolvers to be pushed to the clients
 - Choice to use a self-hosted resolver with Unbound (supports already existing Unbound installations)
 - Choice between TCP and UDP
-- NATed IPv6 support
-- Compression disabled by default to prevent VORACLE. LZ4 (v1/v2) and LZ0 algorithms available otherwise.
+- Flexible IPv4/IPv6 support:
+  - IPv4 or IPv6 server endpoint (how clients connect)
+  - IPv4-only, IPv6-only, or dual-stack clients (VPN addressing and internet access)
+  - All combinations supported: 4→4, 4→4/6, 4→6, 6→4, 6→6, 6→4/6
+  - Automatic leak prevention: blocks undesired protocol in single-stack modes
 - Unprivileged mode: run as `nobody`/`nogroup`
 - Block DNS leaks on Windows 10
 - Randomised server certificate name
 - Choice to protect clients with a password (private key encryption)
-- Option to allow multiple devices to use the same client profile simultaneously
+- Option to allow multiple devices to use the same client profile simultaneously (disables persistent IP addresses)
+- **Peer fingerprint authentication** (OpenVPN 2.6+): Simplified WireGuard-like authentication without a CA
 - Many other little things!
 
 ## Compatibility
 
 The script supports these Linux distributions:
 
-|                    | Support |
-| ------------------ | ------- |
-| AlmaLinux >= 8     | ✅ 🤖   |
-| Amazon Linux 2023  | ✅ 🤖   |
-| Arch Linux         | ✅ 🤖   |
-| CentOS Stream >= 8 | ✅ 🤖   |
-| Debian >= 11       | ✅ 🤖   |
-| Fedora >= 40       | ✅ 🤖   |
-| Oracle Linux >= 8  | ✅ 🤖   |
-| Rocky Linux >= 8   | ✅ 🤖   |
-| Ubuntu >= 18.04    | ✅ 🤖   |
+|                     | Support |
+| ------------------- | ------- |
+| AlmaLinux >= 8      | ✅ 🤖   |
+| Amazon Linux 2023   | ✅ 🤖   |
+| Arch Linux          | ✅ 🤖   |
+| CentOS Stream >= 8  | ✅ 🤖   |
+| Debian >= 11        | ✅ 🤖   |
+| Fedora >= 40        | ✅ 🤖   |
+| openSUSE Leap >= 16 | ✅ 🤖   |
+| openSUSE Tumbleweed | ✅ 🤖   |
+| Oracle Linux >= 8   | ✅ 🤖   |
+| Rocky Linux >= 8    | ✅ 🤖   |
+| Ubuntu >= 18.04     | ✅ 🤖   |
 
 To be noted:
 
 - The script is regularly tested against the distributions marked with a 🤖 only.
   - It's only tested on `amd64` architecture.
 - The script requires `systemd`.
+
+### Recommended providers
+
+- [Vultr](https://www.vultr.com/?ref=8948982-8H): Worldwide locations, IPv6 support, starting at \$2.5/month
+- [Hetzner](https://hetzner.cloud/?ref=ywtlvZsjgeDq): Worldwide locations, IPv6, 20 TB of traffic, starting at €3.59/month
+- [Digital Ocean](https://m.do.co/c/ed0ba143fe53): Worldwide locations, IPv6 support, starting at \$4/month
+
+## Usage
+
+First, download the script on your server and make it executable:
+
+```bash
+curl -O https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh
+chmod +x openvpn-install.sh
+```
+
+You need to run the script as root and have the TUN module enabled.
+
+### Interactive Mode
+
+The easiest way to get started is the interactive menu:
+
+```bash
+./openvpn-install.sh interactive
+```
+
+This will guide you through installation and client management.
+
+In your home directory, you will have `.ovpn` files. These are the client configuration files. Download them from your server (using `scp` for example) and connect using your favorite OpenVPN client.
+
+If you have any question, head to the [FAQ](#faq) first. And if you need help, you can open a [discussion](https://github.com/angristan/openvpn-install/discussions). Please search existing issues and discussions first.
+
+### CLI Mode
+
+> [!WARNING]
+> API compatibility is not guaranteed. Breaking changes may occur between versions. If you use this script programmatically (e.g., in automation or CI/CD), pin to a specific commit rather than using the master branch.
+
+For automation and scripting, use the CLI interface:
+
+```bash
+# Install with defaults
+./openvpn-install.sh install
+
+# Add a client
+./openvpn-install.sh client add alice
+
+# List clients
+./openvpn-install.sh client list
+
+# Revoke a client (immediately disconnects if connected)
+./openvpn-install.sh client revoke alice
+```
+
+#### Commands
+
+```text
+openvpn-install <command> [options]
+
+Commands:
+  install       Install and configure OpenVPN server
+  uninstall     Remove OpenVPN server
+  client        Manage client certificates
+  server        Server management
+  interactive   Launch interactive menu
+
+Global Options:
+  --verbose     Show detailed output
+  --log <path>  Log file path (default: openvpn-install.log)
+  --no-log      Disable file logging
+  --no-color    Disable colored output
+  -h, --help    Show help
+```
+
+Run `./openvpn-install.sh <command> --help` for command-specific options.
+
+#### Client Management
+
+```bash
+# Add a new client
+./openvpn-install.sh client add alice
+
+# Add a password-protected client
+./openvpn-install.sh client add bob --password
+
+# Revoke a client
+./openvpn-install.sh client revoke alice
+
+# Renew a client certificate
+./openvpn-install.sh client renew bob --cert-days 365
+```
+
+List all clients:
+
+```text
+$ ./openvpn-install.sh client list
+══ Client Certificates ══
+[INFO] Found 3 client certificate(s)
+
+   Name      Status   Expiry      Remaining
+   ----      ------   ------      ---------
+   alice     Valid    2035-01-15  3650 days
+   bob       Valid    2035-01-15  3650 days
+   charlie   Revoked  2035-01-15  unknown
+```
+
+JSON output for scripting:
+
+```text
+$ ./openvpn-install.sh client list --format json | jq
+{
+  "clients": [
+    {
+      "name": "alice",
+      "status": "valid",
+      "expiry": "2035-01-15",
+      "days_remaining": 3650
+    },
+    {
+      "name": "bob",
+      "status": "valid",
+      "expiry": "2035-01-15",
+      "days_remaining": 3650
+    },
+    {
+      "name": "charlie",
+      "status": "revoked",
+      "expiry": "2035-01-15",
+      "days_remaining": null
+    }
+  ]
+}
+```
+
+#### Server Management
+
+```bash
+# Renew server certificate
+./openvpn-install.sh server renew
+
+# Uninstall OpenVPN
+./openvpn-install.sh uninstall
+```
+
+Show connected clients (data refreshes every 60 seconds):
+
+```text
+$ ./openvpn-install.sh server status
+══ Connected Clients ══
+[INFO] Found 2 connected client(s)
+
+   Name    Real Address          VPN IP      Connected Since   Transfer
+   ----    ------------          ------      ---------------   --------
+   alice   203.0.113.45:52341    10.8.0.2    2025-01-15 14:32  ↓1.2M ↑500K
+   bob     198.51.100.22:41892   10.8.0.3    2025-01-15 09:15  ↓800K ↑200K
+
+[INFO] Note: Data refreshes every 60 seconds.
+```
+
+#### Install Options
+
+The `install` command supports many options for customization:
+
+```bash
+# Custom port and protocol
+./openvpn-install.sh install --port 443 --protocol tcp
+
+# Custom DNS provider
+./openvpn-install.sh install --dns quad9
+
+# Custom encryption settings
+./openvpn-install.sh install --cipher AES-256-GCM --cert-type rsa --rsa-bits 4096
+
+# Custom VPN subnet
+./openvpn-install.sh install --subnet-ipv4 10.9.0.0
+
+# Enable dual-stack (IPv4 + IPv6) for clients
+./openvpn-install.sh install --client-ipv4 --client-ipv6
+
+# IPv6-only clients (no IPv4)
+./openvpn-install.sh install --no-client-ipv4 --client-ipv6
+
+# IPv6 endpoint (server listens on IPv6, clients connect via IPv6)
+./openvpn-install.sh install --endpoint-type 6 --endpoint 2001:db8::1
+
+# Custom IPv6 subnet for dual-stack setup
+./openvpn-install.sh install --client-ipv6 --subnet-ipv6 fd00:1234:5678::
+
+# Skip initial client creation
+./openvpn-install.sh install --no-client
+
+# Full example with multiple options
+./openvpn-install.sh install \
+  --port 443 \
+  --protocol tcp \
+  --dns cloudflare \
+  --cipher AES-256-GCM \
+  --client mydevice \
+  --client-cert-days 365
+```
+
+**Network Options:**
+
+- `--endpoint <host>` - Public IP or hostname for clients (default: auto-detected)
+- `--endpoint-type <4|6>` - Endpoint IP version (default: `4`)
+- `--ip <addr>` - Server listening IP (default: auto-detected)
+- `--client-ipv4` - Enable IPv4 for VPN clients (default: enabled)
+- `--no-client-ipv4` - Disable IPv4 for VPN clients
+- `--client-ipv6` - Enable IPv6 for VPN clients (default: disabled)
+- `--no-client-ipv6` - Disable IPv6 for VPN clients
+- `--subnet-ipv4 <x.x.x.0>` - IPv4 VPN subnet (default: `10.8.0.0`)
+- `--subnet-ipv6 <prefix>` - IPv6 VPN subnet (default: `fd42:42:42:42::`)
+- `--port <num>` - OpenVPN port (default: `1194`)
+- `--port-random` - Use random port (49152-65535)
+- `--protocol <udp|tcp>` - Protocol (default: `udp`)
+- `--mtu <size>` - Tunnel MTU (default: `1500`)
+
+**DNS Options:**
+
+- `--dns <provider>` - DNS provider (default: `cloudflare`). Options: `system`, `unbound`, `cloudflare`, `quad9`, `quad9-uncensored`, `fdn`, `dnswatch`, `opendns`, `google`, `yandex`, `adguard`, `nextdns`, `custom`
+- `--dns-primary <ip>` - Custom primary DNS (requires `--dns custom`)
+- `--dns-secondary <ip>` - Custom secondary DNS (requires `--dns custom`)
+
+**Security Options:**
+
+- `--cipher <cipher>` - Data cipher (default: `AES-128-GCM`). Options: `AES-128-GCM`, `AES-192-GCM`, `AES-256-GCM`, `AES-128-CBC`, `AES-192-CBC`, `AES-256-CBC`, `CHACHA20-POLY1305`
+- `--cert-type <ecdsa|rsa>` - Certificate type (default: `ecdsa`)
+- `--cert-curve <curve>` - ECDSA curve (default: `prime256v1`). Options: `prime256v1`, `secp384r1`, `secp521r1`
+- `--rsa-bits <2048|3072|4096>` - RSA key size (default: `2048`)
+- `--hmac <alg>` - HMAC algorithm (default: `SHA256`). Options: `SHA256`, `SHA384`, `SHA512`
+- `--tls-sig <mode>` - TLS mode (default: `crypt-v2`). Options: `crypt-v2`, `crypt`, `auth`
+- `--auth-mode <mode>` - Authentication mode (default: `pki`). Options: `pki` (CA-based), `fingerprint` (peer-fingerprint, requires OpenVPN 2.6+)
+- `--tls-version-min <1.2|1.3>` - Minimum TLS version (default: `1.2`)
+- `--tls-ciphersuites <list>` - TLS 1.3 cipher suites, colon-separated (default: `TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256`)
+- `--tls-groups <list>` - Key exchange groups, colon-separated (default: `X25519:prime256v1:secp384r1:secp521r1`)
+- `--server-cert-days <n>` - Server cert validity in days (default: `3650`)
+
+**Client Options:**
+
+- `--client <name>` - Initial client name (default: `client`)
+- `--client-password [pass]` - Password-protect client key (default: no password)
+- `--client-cert-days <n>` - Client cert validity in days (default: `3650`)
+- `--no-client` - Skip initial client creation
+
+**Other Options:**
+
+- `--multi-client` - Allow same cert on multiple devices (default: disabled)
+
+#### Automation Examples
+
+**Batch client creation:**
+
+```bash
+#!/bin/bash
+for user in alice bob charlie; do
+  ./openvpn-install.sh client add "$user"
+done
+```
+
+**Create clients from a file:**
+
+```bash
+#!/bin/bash
+while read -r user; do
+  ./openvpn-install.sh client add "$user"
+done < users.txt
+```
+
+**JSON output for scripting:**
+
+```bash
+# Get client list as JSON
+./openvpn-install.sh client list --format json | jq '.clients[] | select(.status == "valid")'
+
+# Get connected clients as JSON
+./openvpn-install.sh server status --format json
+```
 
 ## Fork
 
@@ -172,8 +380,8 @@ More Q&A in [FAQ.md](FAQ.md).
 
 **A:** I recommend these:
 
-- [Vultr](https://www.vultr.com/?ref=8948982-8H): Worldwide locations, IPv6 support, starting at \$5/month
-- [Hetzner](https://hetzner.cloud/?ref=ywtlvZsjgeDq): Germany, Finland and USA. IPv6, 20 TB of traffic, starting at 4.5€/month
+- [Vultr](https://www.vultr.com/?ref=8948982-8H): Worldwide locations, IPv6 support, starting at \$2.5/month
+- [Hetzner](https://hetzner.cloud/?ref=ywtlvZsjgeDq): Worldwide locations, IPv6, 20 TB of traffic, starting at €3.59/month
 - [Digital Ocean](https://m.do.co/c/ed0ba143fe53): Worldwide locations, IPv6 support, starting at \$4/month
 
 ---
@@ -198,7 +406,7 @@ More Q&A in [FAQ.md](FAQ.md).
 
 **Q:** Is there an OpenVPN documentation?
 
-**A:** Yes, please head to the [OpenVPN Manual](https://community.openvpn.net/openvpn/wiki/Openvpn24ManPage), which references all the options.
+**A:** Yes, please head to the [OpenVPN Manual](https://openvpn.net/community-docs/community-articles/openvpn-2-6-manual.html), which references all the options.
 
 ---
 
@@ -206,40 +414,49 @@ More Q&A in [FAQ.md](FAQ.md).
 
 ## Contributing
 
-## Discuss changes
+### Discuss changes
 
 Please open an issue before submitting a PR if you want to discuss a change, especially if it's a big one.
 
-### Code formatting
-
-We use [shellcheck](https://github.com/koalaman/shellcheck) and [shfmt](https://github.com/mvdan/sh) to enforce bash styling guidelines and good practices. They are executed for each commit / PR with GitHub Actions, so you can check the configuration [here](https://github.com/angristan/openvpn-install/blob/master/.github/workflows/lint.yml).
-
 ## Security and Encryption
 
-> **Note**
-> This section covers security features for OpenVPN 2.4+. OpenVPN 2.5+ introduced additional features like TLS 1.3 support, but this script maintains TLS 1.2 as the minimum for broader client compatibility.
+> [!NOTE]
+> This script was created in 2016 when OpenVPN's defaults were quite weak. Back then, customising encryption settings was essential for a secure setup. Since then, OpenVPN has significantly improved its defaults, but the script still offers customisation options.
 
-OpenVPN's default settings are pretty weak regarding encryption. This script aims to improve that.
+OpenVPN 2.3 and earlier shipped with outdated defaults like Blowfish (BF-CBC), TLS 1.0, and SHA1. Each major release since has brought significant improvements:
 
-OpenVPN 2.4 was a great update regarding encryption. It added support for ECDSA, ECDH, AES GCM, NCP and tls-crypt.
+- **OpenVPN 2.4** (2016): Added ECDSA, ECDH, AES-GCM, NCP (cipher negotiation), and tls-crypt
+- **OpenVPN 2.5** (2020): Default cipher changed from BF-CBC to AES-256-GCM:AES-128-GCM, added ChaCha20-Poly1305, tls-crypt-v2, and TLS 1.3 support
+- **OpenVPN 2.6** (2023): TLS 1.2 minimum by default, compression blocked by default, `--peer-fingerprint` for PKI-less setups, and DCO kernel acceleration
 
 If you want more information about an option mentioned below, head to the [OpenVPN manual](https://community.openvpn.net/openvpn/wiki/Openvpn24ManPage). It is very complete.
 
-Most of OpenVPN's encryption-related stuff is managed by [Easy-RSA](https://github.com/OpenVPN/easy-rsa). Defaults parameters are in the [vars.example](https://github.com/OpenVPN/easy-rsa/blob/v3.0.7/easyrsa3/vars.example) file.
+Certificate and PKI management is handled by [Easy-RSA](https://github.com/OpenVPN/easy-rsa). Default parameters are in the [vars.example](https://github.com/OpenVPN/easy-rsa/blob/v3.2.2/easyrsa3/vars.example) file.
 
 ### Compression
 
-By default, OpenVPN doesn't enable compression. This script provides support for LZ0 and LZ4 (v1/v2) algorithms, the latter being more efficient.
+This script used to support LZ4 and LZO compression algorithms, but discouraged their use due to the [VORACLE attack](https://community.openvpn.net/Security%20Announcements/VORACLE) vulnerability.
 
-However, it is discouraged to use compression since the [VORACLE attack](https://protonvpn.com/blog/voracle-attack/) makes use of it.
+OpenVPN 2.6+ defaults `--allow-compression` to `no`, blocking even server-pushed compression. Now that OpenVPN is removing compression support entirely, this script no longer supports it.
 
 ### TLS version
 
-OpenVPN accepts TLS 1.0 by default, which is nearly [20 years old](https://en.wikipedia.org/wiki/Transport_Layer_Security#TLS_1.0).
+> [!NOTE]
+> OpenVPN 2.6+ defaults to TLS 1.2 minimum. Prior versions accepted TLS 1.0 by default.
 
-With `tls-version-min 1.2` we enforce TLS 1.2, which the best protocol available currently for OpenVPN.
+OpenVPN 2.5 and earlier accepted TLS 1.0 by default, which is nearly [20 years old](https://en.wikipedia.org/wiki/Transport_Layer_Security#TLS_1.0).
 
-TLS 1.2 is supported since OpenVPN 2.3.3.
+This script defaults to `tls-version-min 1.2` for compatibility with all OpenVPN 2.4+ clients. You can optionally set `tls-version-min 1.3` for environments where all clients support TLS 1.3.
+
+**TLS 1.3 support** was added in OpenVPN 2.5 and requires OpenSSL 1.1.1+. TLS 1.3 offers improved security and performance with a simplified handshake.
+
+The script configures TLS 1.3 cipher suites via `--tls-ciphersuites` (separate from the TLS 1.2 `--tls-cipher` option). The default TLS 1.3 cipher suites are:
+
+- `TLS_AES_256_GCM_SHA384`
+- `TLS_AES_128_GCM_SHA256`
+- `TLS_CHACHA20_POLY1305_SHA256`
+
+TLS 1.2 is supported since OpenVPN 2.3.3. TLS 1.3 is supported since OpenVPN 2.5.
 
 ### Certificate
 
@@ -256,9 +473,51 @@ It defaults to ECDSA with `prime256v1`.
 
 OpenVPN uses `SHA-256` as the signature hash by default, and so does the script. It provides no other choice as of now.
 
+### Authentication Mode
+
+The script supports two authentication modes:
+
+#### PKI Mode (default)
+
+Traditional Certificate Authority (CA) based authentication. The server and all clients have certificates signed by the same CA. Client revocation is handled via Certificate Revocation Lists (CRL).
+
+This is the recommended mode for larger deployments where you need:
+
+- Centralized certificate management
+- Standard CRL-based revocation
+- Compatibility with all OpenVPN versions
+
+#### Peer Fingerprint Mode (OpenVPN 2.6+)
+
+A simplified WireGuard-like authentication model using SHA256 certificate fingerprints instead of a CA chain. Each peer (server and clients) has a self-signed certificate, and peers authenticate each other by verifying fingerprints.
+
+```bash
+# Install with fingerprint mode
+./openvpn-install.sh install --auth-mode fingerprint
+```
+
+Benefits:
+
+- Simpler setup: No CA infrastructure needed
+- Easier to understand: Similar to SSH's `known_hosts` model
+- Ideal for small setups: Home networks, labs, small teams
+
+How it works:
+
+1. Server generates a self-signed certificate and stores its fingerprint
+2. Each client generates a self-signed certificate
+3. Client fingerprints are added to the server's `<peer-fingerprint>` block
+4. Clients verify the server using the server's fingerprint
+5. Revocation removes the fingerprint from the server config (no CRL needed)
+
+Trade-off: Revoking a client requires reloading OpenVPN (fingerprints are in server.conf). In PKI mode, the CRL file is re-read automatically on new connections.
+
 ### Data channel
 
-By default, OpenVPN uses `BF-CBC` as the data channel cipher. Blowfish is an old (1993) and weak algorithm. Even the official OpenVPN documentation admits it.
+> [!NOTE]
+> The default data channel cipher changed in OpenVPN 2.5. Prior versions defaulted to `BF-CBC`, while OpenVPN 2.5+ defaults to `AES-256-GCM:AES-128-GCM`. OpenVPN 2.6+ also includes `CHACHA20-POLY1305` in the default cipher list when available.
+
+By default, OpenVPN 2.4 and earlier used `BF-CBC` as the data channel cipher. Blowfish is an old (1993) and weak algorithm. Even the official OpenVPN documentation admits it.
 
 > The default is BF-CBC, an abbreviation for Blowfish in Cipher Block Chaining mode.
 >
@@ -289,11 +548,13 @@ The script supports the following ciphers:
 
 And defaults to `AES-128-GCM`.
 
-OpenVPN 2.4 added a feature called "NCP": _Negotiable Crypto Parameters_. It means you can provide a cipher suite like with HTTPS. It is set to `AES-256-GCM:AES-128-GCM` by default and overrides the `--cipher` parameter when used with an OpenVPN 2.4 client. For the sake of simplicity, the script set both the `--cipher` and `--ncp-cipher` to the cipher chosen above.
+OpenVPN 2.4 added a feature called "NCP": _Negotiable Crypto Parameters_. It means you can provide a cipher suite like with HTTPS. It is set to `AES-256-GCM:AES-128-GCM` by default and overrides the `--cipher` parameter when used with an OpenVPN 2.4 client. For the sake of simplicity, the script sets `--cipher` (fallback for non-NCP clients), `--data-ciphers` (modern OpenVPN 2.5+ naming), and `--ncp-ciphers` (legacy alias for OpenVPN 2.4 compatibility) to the cipher chosen above.
 
 ### Control channel
 
 OpenVPN 2.4 will negotiate the best cipher available by default (e.g ECDHE+AES-256-GCM)
+
+#### TLS 1.2 ciphers (`--tls-cipher`)
 
 The script proposes the following options, depending on the certificate:
 
@@ -308,20 +569,34 @@ The script proposes the following options, depending on the certificate:
 
 It defaults to `TLS-ECDHE-*-WITH-AES-128-GCM-SHA256`.
 
-### Diffie-Hellman key exchange
+#### TLS 1.3 ciphers (`--tls-ciphersuites`)
 
-OpenVPN uses a 2048 bits DH key by default.
+When TLS 1.3 is negotiated, a separate set of cipher suites is used. These are configured via `--tls-ciphersuites` and use OpenSSL naming conventions:
 
-OpenVPN 2.4 added support for ECDH keys. Elliptic curve cryptography is faster, lighter and more secure.
+- `TLS_AES_256_GCM_SHA384`
+- `TLS_AES_128_GCM_SHA256`
+- `TLS_CHACHA20_POLY1305_SHA256`
 
-Also, generating a classic DH keys can take a long, looong time. ECDH keys are ephemeral: they are generated on-the-fly.
+By default, all three cipher suites are enabled. TLS 1.3 cipher suites are simpler because they don't include the key exchange algorithm (which is negotiated separately via key shares).
 
-The script provides the following options:
+### Key exchange
 
-- ECDH: `prime256v1`/`secp384r1`/`secp521r1` curves
-- DH: `2048`/`3072`/`4096` bits keys
+OpenVPN historically defaulted to 2048-bit DH parameters for key exchange. This script used to offer both DH (with configurable key sizes) and ECDH as alternatives.
 
-It defaults to `prime256v1`.
+OpenVPN 2.4 added ECDH support, and OpenVPN 2.7 made `dh none` (ECDH) the default, as finite-field DH is being deprecated. Since ECDH is now universally supported and preferred, this script no longer offers traditional DH.
+
+The script configures `tls-groups` with the following preference list:
+
+```
+X25519:prime256v1:secp384r1:secp521r1
+```
+
+- **X25519**: Fast, modern curve (Curve25519), widely supported
+- **prime256v1**: NIST P-256, most compatible
+- **secp384r1**: NIST P-384, higher security
+- **secp521r1**: NIST P-521, highest security
+
+You can customize this with `--tls-groups`.
 
 ### HMAC digest algorithm
 
@@ -339,7 +614,7 @@ The script provides the following choices:
 
 It defaults to `SHA256`.
 
-### `tls-auth` and `tls-crypt`
+### `tls-auth`, `tls-crypt`, and `tls-crypt-v2`
 
 From the OpenVPN wiki, about `tls-auth`:
 
@@ -361,7 +636,23 @@ So both provide an additional layer of security and mitigate DoS attacks. They a
 
 `tls-crypt` is an OpenVPN 2.4 feature that provides encryption in addition to authentication (unlike `tls-auth`). It is more privacy-friendly.
 
-The script supports both and uses `tls-crypt` by default.
+`tls-crypt-v2` is an OpenVPN 2.5 feature that builds on `tls-crypt` by using **per-client keys** instead of a shared key. Each client receives a unique key derived from a server key. This provides:
+
+- **Better security**: If a client key is compromised, other clients are not affected
+- **Easier key management**: Client keys can be revoked individually without regenerating the server key
+- **Scalability**: Better suited for large deployments with many clients
+
+The script supports all three options:
+
+- `tls-crypt-v2` (default): Per-client keys for better security
+- `tls-crypt`: Shared key for all clients, compatible with OpenVPN 2.4+
+- `tls-auth`: HMAC authentication only (no encryption), compatible with older clients
+
+### Certificate type verification (`remote-cert-tls`)
+
+The server is configured with `remote-cert-tls client`, which requires connecting peers to have a certificate with the "TLS Web Client Authentication" extended key usage. This prevents a server certificate from being used to impersonate a client.
+
+Similarly, clients are configured with `remote-cert-tls server` to ensure they only connect to servers presenting valid server certificates. This protects against an attacker with a valid client certificate setting up a rogue server.
 
 ### Data Channel Offload (DCO)
 
@@ -375,9 +666,8 @@ DCO was merged into the Linux kernel 6.16 (April 2025).
 - Linux kernel 6.16+ (built-in) or `ovpn-dco` kernel module
 - UDP protocol (TCP is not supported)
 - AEAD cipher (`AES-128-GCM`, `AES-256-GCM`, or `CHACHA20-POLY1305`)
-- Compression disabled
 
-The script's default settings (AES-128-GCM, UDP, no compression) are DCO-compatible. When DCO is available and the configuration is compatible, OpenVPN will automatically use it for improved performance.
+The script's default settings (AES-128-GCM, UDP) are DCO-compatible. When DCO is available and the configuration is compatible, OpenVPN will automatically use it for improved performance.
 
 **Note:** DCO must be supported on both the server and the client for full acceleration. Client support is available in OpenVPN 2.6+ (Linux, Windows, FreeBSD) and OpenVPN Connect 3.4+ (Windows). macOS does not currently support DCO, but clients can still connect to DCO-enabled servers with partial performance benefits on the server-side.
 

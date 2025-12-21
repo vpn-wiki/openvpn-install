@@ -11,7 +11,18 @@ You can, of course, it's even recommended, update the `openvpn` package with you
 
 **Q:** How do I renew certificates before they expire?
 
-**A:** Run the script again and select "Renew certificates" from the menu. You can renew either client certificates or the server certificate. The script will show you the current expiration date for each certificate and let you choose a new validity period (default: 3650 days / 10 years).
+**A:** Use the CLI commands to renew certificates:
+
+```bash
+# Renew a client certificate
+./openvpn-install.sh client renew alice
+
+# Renew with custom validity period (365 days)
+./openvpn-install.sh client renew alice --cert-days 365
+
+# Renew the server certificate
+./openvpn-install.sh server renew
+```
 
 For client renewals, a new `.ovpn` file will be generated that you need to distribute to the client. For server renewals, the OpenVPN service will need to be restarted (the script will prompt you).
 
@@ -36,7 +47,7 @@ up /etc/openvpn/update-resolv-conf
 down /etc/openvpn/update-resolv-conf
 ```
 
-Centos 6, 7
+CentOS 6, 7
 
 ```
 script-security 2
@@ -44,7 +55,7 @@ up /usr/share/doc/openvpn-2.4.8/contrib/pull-resolv-conf/client.up
 down /usr/share/doc/openvpn-2.4.8/contrib/pull-resolv-conf/client.down
 ```
 
-Centos 8, Fedora 30, 31
+CentOS 8, Fedora 30, 31
 
 ```
 script-security 2
@@ -62,20 +73,6 @@ down /usr/share/openvpn/contrib/pull-resolv-conf/client.down
 
 ---
 
-**Q:** Can I use an OpenVPN 2.3 client?
-
-**A:** Yes. I really recommend using an up-to-date client, but if you really need it, choose the following options:
-
-- No compression or LZ0
-- RSA certificate
-- DH Key
-- AES CBC
-- tls-auth
-
-If your client is <2.3.3, remove `tls-version-min 1.2` from your `/etc/openvpn/server.conf` and `.ovpn` files.
-
----
-
 **Q:** IPv6 is not working on my Hetzner VM
 
 **A:** This an issue on their side. See <https://angristan.xyz/fix-ipv6-hetzner-cloud/>
@@ -88,9 +85,9 @@ If your client is <2.3.3, remove `tls-version-min 1.2` from your `/etc/openvpn/s
 
 ---
 
-**Q:** What syctl and iptables changes are made by the script?
+**Q:** What sysctl and firewall changes are made by the script?
 
-**A:** Iptables rules are saved at `/etc/iptables/add-openvpn-rules.sh` and `/etc/iptables/rm-openvpn-rules.sh`. They are managed by the service `/etc/systemd/system/iptables-openvpn.service`
+**A:** If firewalld is active, the script uses `firewall-cmd --permanent` to configure port, masquerade, and rich rules. Otherwise, iptables rules are saved at `/etc/iptables/add-openvpn-rules.sh` and `/etc/iptables/rm-openvpn-rules.sh`, managed by `/etc/systemd/system/iptables-openvpn.service`.
 
 Sysctl options are at `/etc/sysctl.d/99-openvpn.conf`
 
@@ -110,56 +107,130 @@ Sysctl options are at `/etc/sysctl.d/99-openvpn.conf`
 
   type `yes` when asked to customize encryption settings and choose `tls-auth`
 
-- `Options error: Unrecognized option or missing parameter(s) in config.ovpn:36: tls-version-min (2.3.2)` :
-
-  see question "Can I use an OpenVPN 2.3 client?"
-
 ---
 
-**Q:** How can I access computers the OpenVPN server's remote LAN?
+**Q:** How can I access computers on the OpenVPN server's LAN?
 
-**A:** Add a route with the subnet of the remote network to `/etc/openvpn/server.conf` and restart openvpn. Example: `push "route 192.168.1.0 255.255.255.0"` if the server's LAN is `192.168.1.0/24`
+**A:** Two steps are required:
+
+1. **Push a route to clients** - Add the LAN subnet to `/etc/openvpn/server/server.conf`:
+
+   ```
+   push "route 192.168.1.0 255.255.255.0"
+   ```
+
+   Replace `192.168.1.0/24` with your actual LAN subnet.
+
+2. **Enable routing back to VPN clients** - Choose one of these options:
+   - **Option A: Add a static route on your router** (recommended when you can configure your router)
+
+     On your LAN router, add a route for the VPN subnet (default `10.8.0.0/24`) pointing to the OpenVPN server's LAN IP. This allows LAN devices to reply to VPN clients without NAT.
+
+   - **Option B: Masquerade VPN traffic to LAN**
+
+     If you can't modify your router, add a masquerade rule so VPN traffic appears to come from the server:
+
+     ```bash
+     # iptables
+     iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -d 192.168.1.0/24 -j MASQUERADE
+
+     # or nftables
+     nft add rule ip nat postrouting ip saddr 10.8.0.0/24 ip daddr 192.168.1.0/24 masquerade
+     ```
+
+     Make this persistent by adding it to your firewall scripts.
+
+Restart OpenVPN after making changes: `systemctl restart openvpn-server@server`
 
 ---
 
 **Q:** How can I add multiple users in one go?
 
-**A:** Here is a sample bash script to achieve this:
+**A:** Here is a sample Bash script to achieve this:
 
-```sh
+```bash
+#!/bin/bash
 userlist=(user1 user2 user3)
 
-for i in ${userlist[@]};do
-   MENU_OPTION=1 CLIENT=$i PASS=1 ./openvpn-install.sh
+for user in "${userlist[@]}"; do
+  ./openvpn-install.sh client add "$user"
 done
 ```
 
 From a list in a text file:
 
-```sh
-while read USER
-    do MENU_OPTION="1" CLIENT="$USER" PASS="1" ./openvpn-install.sh
+```bash
+#!/bin/bash
+while read -r user; do
+  ./openvpn-install.sh client add "$user"
 done < users.txt
+```
+
+To add password-protected clients:
+
+```bash
+#!/bin/bash
+./openvpn-install.sh client add alice --password "secretpass123"
 ```
 
 ---
 
 **Q:** How do I change the default `.ovpn` file created for future clients?
 
-**A:** You can edit the template out of which `.ovpn` files are created by editing `/etc/openvpn/client-template.txt`
+**A:** You can edit the template out of which `.ovpn` files are created by editing `/etc/openvpn/server/client-template.txt`
 
 ---
 
 **Q:** For my clients - I want to set my internal network to pass through the VPN and the rest to go through my internet?
 
-**A:** You would need to edit the `.ovpn` file. You can edit the template out of which those files are created by editing `/etc/openvpn/client-template.txt` file and adding
+**A:** You would need to edit the `.ovpn` file. You can edit the template out of which those files are created by editing `/etc/openvpn/server/client-template.txt` file and adding
 
 ```sh
 route-nopull
 route 10.0.0.0 255.0.0.0
 ```
 
-So for example - here it would route all traffic of `10.0.0.0/8` to the vpn. And the rest through the internet.
+So for example - here it would route all traffic of `10.0.0.0/8` to the VPN. And the rest through the internet.
+
+---
+
+**Q:** How do I configure split-tunnel mode on the server (route only specific networks through VPN for all clients)?
+
+**A:** By default, the script configures full-tunnel mode where all client traffic goes through the VPN. To configure split-tunnel (only specific networks routed through VPN), edit `/etc/openvpn/server/server.conf`:
+
+1. Remove or comment out the redirect-gateway line:
+
+   ```
+   #push "redirect-gateway def1 bypass-dhcp"
+   ```
+
+2. Add routes for the networks you want to tunnel:
+
+   ```
+   push "route 10.0.0.0 255.0.0.0"
+   push "route 192.168.1.0 255.255.255.0"
+   ```
+
+3. Optionally remove DNS push directives if you don't want VPN DNS:
+
+   ```
+   #push "dhcp-option DNS 1.1.1.1"
+   ```
+
+4. For IPv6, remove or comment out:
+
+   ```
+   #push "route-ipv6 2000::/3"
+   #push "redirect-gateway ipv6"
+   ```
+
+   Or add specific IPv6 routes:
+
+   ```
+   push "route-ipv6 2001:db8::/32"
+   ```
+
+5. Restart OpenVPN: `systemctl restart openvpn-server@server`
 
 ---
 
@@ -182,3 +253,21 @@ label fc00::/7      1
 ```
 
 This will not work properly unless you add you your VPN server `server.conf` one or two lines to push at least 1 (one) IPv6 DNS server. Most providers have IPv6 servers as well, add two more lines of `push "dhcp-option DNS <IPv6>"`
+
+---
+
+**Q:** How can I run OpenVPN on port 443 alongside a web server?
+
+**A:** Use OpenVPN's `port-share` feature to multiplex both services on the same port. When OpenVPN receives non-VPN traffic, it forwards it to your web server.
+
+1. During installation, select **TCP** and port **443**
+2. Configure your web server to listen on a different port (e.g., 8443)
+3. Add to `/etc/openvpn/server/server.conf`:
+
+   ```
+   port-share 127.0.0.1 8443
+   ```
+
+4. Restart OpenVPN: `systemctl restart openvpn-server@server`
+
+This is useful when your network only allows outbound connections on port 443. Note that TCP has worse performance than UDP for VPN traffic due to head-of-line blocking, so only use this when necessary.
