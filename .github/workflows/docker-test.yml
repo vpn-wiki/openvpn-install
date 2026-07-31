@@ -36,6 +36,8 @@ jobs:
             image: debian:11
           - name: debian-12
             image: debian:12
+          - name: debian-sid
+            image: debian:sid
           - name: centos-stream-9
             image: quay.io/centos/centos:stream9
           - name: centos-stream-10
@@ -135,7 +137,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Build server image
         run: |

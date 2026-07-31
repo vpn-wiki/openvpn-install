@@ -78,6 +78,9 @@ test-debian-11:
 test-debian-12:
 	$(MAKE) test BASE_IMAGE=debian:12
 
+test-debian-sid:
+	$(MAKE) test BASE_IMAGE=debian:sid
+
 test-fedora-40:
 	$(MAKE) test BASE_IMAGE=fedora:40
 
@@ -125,6 +128,7 @@ test-all:
 	$(MAKE) test-ubuntu-24.04
 	$(MAKE) test-debian-11
 	$(MAKE) test-debian-12
+	$(MAKE) test-debian-sid
 	$(MAKE) test-fedora-40
 	$(MAKE) test-fedora-41
 	$(MAKE) test-rocky-8

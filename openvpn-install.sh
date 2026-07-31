@@ -1633,7 +1633,8 @@ function checkOS() {
 		source /etc/os-release
 
 		if [[ $ID == "debian" || $ID == "raspbian" ]]; then
-			if [[ $VERSION_ID -lt 11 ]]; then
+			# Debian testing and unstable do not set VERSION_ID.
+			if [[ -n ${VERSION_ID:-} && $VERSION_ID -lt 11 ]]; then
 				log_warn "Your version of Debian is not supported."
 				log_info "However, if you're using Debian >= 11 or unstable/testing, you can continue at your own risk."
 				until [[ $CONTINUE =~ (y|n) ]]; do
@@ -1834,8 +1835,36 @@ function installOpenVPNRepo() {
 	log_info "Setting up official OpenVPN repository..."
 
 	if [[ $OS =~ (debian|ubuntu) ]]; then
+		local repo_url="https://build.openvpn.net/debian/openvpn/stable"
+		local repo_list="/etc/apt/sources.list.d/openvpn-aptrepo.list"
+		local repo_status
+
+		# Remove configuration left by an interrupted or failed installation so
+		# that it cannot prevent the prerequisite package update.
+		if [[ -e $repo_list ]]; then
+			run_cmd_fatal "Removing existing OpenVPN repository configuration" rm -f "$repo_list"
+		fi
+
 		run_cmd_fatal "Update package lists" apt-get update
 		run_cmd_fatal "Installing prerequisites" apt-get install -y ca-certificates curl
+
+		# The OpenVPN repository does not publish packages for every Debian and
+		# Ubuntu suite. This commonly affects Debian testing and unstable.
+		if [[ -z ${VERSION_CODENAME:-} ]]; then
+			log_warn "Distribution codename is unavailable; using distribution packages"
+			return 0
+		fi
+
+		if ! repo_status=$(curl -sL --connect-timeout 10 --max-time 30 -o /dev/null -w "%{http_code}" "${repo_url}/dists/${VERSION_CODENAME}/Release"); then
+			log_fatal "Failed to check OpenVPN repository availability for ${VERSION_CODENAME}"
+		fi
+
+		if [[ $repo_status == "404" ]]; then
+			log_warn "Official OpenVPN repository does not publish packages for ${VERSION_CODENAME}; using distribution packages"
+			return 0
+		elif [[ $repo_status != "200" ]]; then
+			log_fatal "OpenVPN repository availability check returned HTTP ${repo_status} for ${VERSION_CODENAME}"
+		fi
 
 		# Create keyrings directory
 		run_cmd "Creating keyrings directory" mkdir -p /etc/apt/keyrings
@@ -1846,10 +1875,7 @@ function installOpenVPNRepo() {
 		fi
 
 		# Add repository - using stable release
-		if [[ -z "${VERSION_CODENAME}" ]]; then
-			log_fatal "VERSION_CODENAME is not set. Unable to configure OpenVPN repository."
-		fi
-		echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/openvpn-repo-public.asc] https://build.openvpn.net/debian/openvpn/stable ${VERSION_CODENAME} main" >/etc/apt/sources.list.d/openvpn-aptrepo.list
+		echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/openvpn-repo-public.asc] ${repo_url} ${VERSION_CODENAME} main" >"$repo_list"
 
 		log_info "Updating package lists with new repository..."
 		run_cmd_fatal "Update package lists" apt-get update
