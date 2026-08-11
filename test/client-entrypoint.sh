@@ -131,10 +131,13 @@ wait_for_revoked_reconnect_rejected() {
 
 test_dns_resolution() {
 	local label="$1"
+	local test_name="github.com"
 	local success=false
+	# This verifies recursive DNS connectivity. Use an unsigned zone so the test
+	# does not depend on DNSSEC key retrieval over GitHub runner networks.
 	echo "$label: Testing DNS resolution via Unbound ($VPN_GATEWAY)..."
 	for i in $(seq 1 10); do
-		DIG_OUTPUT=$(dig @"$VPN_GATEWAY" example.com +short +time=5 2>&1)
+		DIG_OUTPUT=$(dig @"$VPN_GATEWAY" "$test_name" +short +time=5 2>&1)
 		if [ -n "$DIG_OUTPUT" ] && ! echo "$DIG_OUTPUT" | grep -qi "timed out\|SERVFAIL\|connection refused"; then
 			success=true
 			break
@@ -147,7 +150,7 @@ test_dns_resolution() {
 		echo "PASS: DNS resolution through Unbound works"
 	else
 		echo "FAIL: DNS resolution through Unbound failed after 10 attempts"
-		dig @"$VPN_GATEWAY" example.com +time=5 || true
+		dig @"$VPN_GATEWAY" "$test_name" +time=5 || true
 		exit 1
 	fi
 }
@@ -220,13 +223,42 @@ if [ "${CLIENT_IPV6:-n}" = "y" ]; then
 	fi
 fi
 
-# Test 2: Ping VPN gateway (IPv4)
-echo "Test 2: Pinging VPN gateway (IPv4) ($VPN_GATEWAY)..."
+# Test 2: Verify pushed routes match the access policy.
+echo "Test 2: Checking access policy routes..."
+if [ "${ROUTE_INTERNET:-y}" = "y" ]; then
+	if ip route show | grep -q '^0.0.0.0/1 .* tun0' && ip route show | grep -q '^128.0.0.0/1 .* tun0'; then
+		echo "PASS: Internet routes use the VPN"
+	else
+		echo "FAIL: VPN internet routes are missing"
+		ip route show
+		exit 1
+	fi
+else
+	if ip route show | grep -qE '^(0\.0\.0\.0/1|128\.0\.0\.0/1) .* tun0'; then
+		echo "FAIL: Internet route uses the VPN in split-tunnel mode"
+		ip route show
+		exit 1
+	fi
+	echo "PASS: Internet routes remain outside the VPN"
+fi
+
+if [ -n "${LOCAL_NETWORKS:-}" ]; then
+	while IFS= read -r local_network; do
+		if [[ $local_network == *.* ]] && ! ip route show "$local_network" | grep -q 'tun0'; then
+			echo "FAIL: Local network route is missing for $local_network"
+			ip route show
+			exit 1
+		fi
+	done < <(tr ',' '\n' <<<"$LOCAL_NETWORKS")
+fi
+
+# Test 3: Ping VPN gateway (IPv4)
+echo "Test 3: Pinging VPN gateway (IPv4) ($VPN_GATEWAY)..."
 wait_for_gateway_ping "VPN gateway (IPv4)"
 
-# Test 2b: Ping VPN gateway (IPv6, if enabled)
+# Test 3b: Ping VPN gateway (IPv6, if enabled)
 if [ "${CLIENT_IPV6:-n}" = "y" ]; then
-	echo "Test 2b: Pinging VPN gateway (IPv6) ($VPN_GATEWAY_IPV6)..."
+	echo "Test 3b: Pinging VPN gateway (IPv6) ($VPN_GATEWAY_IPV6)..."
 	if ping6 -c 5 "$VPN_GATEWAY_IPV6"; then
 		echo "PASS: Can ping VPN gateway (IPv6)"
 	else
@@ -235,8 +267,67 @@ if [ "${CLIENT_IPV6:-n}" = "y" ]; then
 	fi
 fi
 
-# Test 3: DNS resolution through Unbound
-test_dns_resolution "Test 3"
+# Packet-level access policy tests use a second VPN client and a LAN-only host.
+if [ -n "${POLICY_E2E:-}" ]; then
+	echo "Test 4: Checking packet-level access policy..."
+	wait_for_file /shared/policy-peer-ip "policy peer VPN address"
+	POLICY_PEER_IP=$(cat /shared/policy-peer-ip)
+	POLICY_LAN_IP="${POLICY_LAN_IP:-10.55.0.20}"
+
+	if [ "$POLICY_E2E" = "allow" ]; then
+		if ping -c 3 -W 2 "$POLICY_PEER_IP" >/dev/null; then
+			echo "PASS: Client-to-client packets are allowed"
+		else
+			echo "FAIL: Cannot reach allowed VPN peer $POLICY_PEER_IP"
+			exit 1
+		fi
+		if ping -c 3 -W 2 "$POLICY_LAN_IP" >/dev/null; then
+			echo "PASS: LAN packets and destination-scoped NAT work"
+		else
+			echo "FAIL: Cannot reach allowed LAN host $POLICY_LAN_IP"
+			exit 1
+		fi
+	elif [ "$POLICY_E2E" = "deny" ]; then
+		if ping -c 1 -W 2 "$POLICY_PEER_IP" >/dev/null; then
+			echo "FAIL: Isolated VPN peer $POLICY_PEER_IP is reachable"
+			exit 1
+		fi
+		echo "PASS: Client-to-client packets are blocked"
+		if ping -c 1 -W 2 "$POLICY_LAN_IP" >/dev/null; then
+			echo "FAIL: Unexposed LAN host $POLICY_LAN_IP is reachable"
+			exit 1
+		fi
+		echo "PASS: Unexposed LAN packets are blocked"
+	else
+		echo "FAIL: Unknown POLICY_E2E value: $POLICY_E2E"
+		exit 1
+	fi
+
+	if [ "${ROUTE_INTERNET:-y}" = "y" ]; then
+		PUBLIC_DNS_OUTPUT=""
+		for _ in $(seq 1 5); do
+			PUBLIC_DNS_OUTPUT=$(dig @1.1.1.1 example.com +short +tcp +time=5 +tries=1 2>&1) || true
+			if grep -qE '^[0-9]+(\.[0-9]+){3}$' <<<"$PUBLIC_DNS_OUTPUT"; then
+				break
+			fi
+			PUBLIC_DNS_OUTPUT=""
+			sleep 2
+		done
+		if [ -n "$PUBLIC_DNS_OUTPUT" ]; then
+			echo "PASS: Direct internet packets traverse VPN forwarding and NAT"
+		else
+			echo "FAIL: Direct public DNS query through the VPN failed"
+			exit 1
+		fi
+	fi
+fi
+
+# Test 5: DNS resolution through Unbound in full-tunnel mode.
+if [ "${ROUTE_INTERNET:-y}" = "y" ]; then
+	test_dns_resolution "Test 5"
+else
+	echo "Test 5: SKIP: VPN DNS is disabled in split-tunnel mode"
+fi
 
 echo ""
 echo "=== Initial connectivity tests PASSED ==="
@@ -269,7 +360,9 @@ sleep 5
 echo "Test: Pinging VPN gateway after renewal ($VPN_GATEWAY)..."
 wait_for_gateway_ping "VPN gateway after renewal"
 
-test_dns_resolution "Test: Post-renewal DNS"
+if [ "${ROUTE_INTERNET:-y}" = "y" ]; then
+	test_dns_resolution "Test: Post-renewal DNS"
+fi
 
 echo ""
 echo "=== Post-renewal connectivity tests PASSED ==="

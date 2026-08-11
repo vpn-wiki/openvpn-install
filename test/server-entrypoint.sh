@@ -3,6 +3,9 @@ set -e
 
 echo "=== OpenVPN Server Container ==="
 
+/opt/test/interactive-install-routing.sh /opt/openvpn-install.sh
+/opt/test/local-network-detection.sh /opt/openvpn-install.sh
+
 # Create TUN device if it doesn't exist
 if [ ! -c /dev/net/tun ]; then
 	mkdir -p /dev/net
@@ -57,9 +60,27 @@ if grep -q $'\033' "$NO_COLOR_OUTPUT"; then
 fi
 echo "PASS: --no-color help output has no ANSI escape sequences"
 
+INVALID_NETWORK_OUTPUT="/tmp/invalid-local-network.log"
+if /opt/openvpn-install.sh install --local-network 192.168.1.1/24 >"$INVALID_NETWORK_OUTPUT" 2>&1; then
+	echo "FAIL: Host-address CIDR was accepted as a local network"
+	exit 1
+elif grep -q "Invalid local network" "$INVALID_NETWORK_OUTPUT"; then
+	echo "PASS: Invalid local network CIDR is rejected"
+else
+	echo "FAIL: Expected local network validation error"
+	cat "$INVALID_NETWORK_OUTPUT"
+	exit 1
+fi
+
 # Calculate VPN gateway from subnet (first usable IP)
 VPN_GATEWAY="${VPN_SUBNET_IPV4%.*}.1"
 export VPN_GATEWAY
+
+# Access policy configuration
+ROUTE_INTERNET="${ROUTE_INTERNET:-y}"
+CLIENT_TO_CLIENT="${CLIENT_TO_CLIENT:-n}"
+LOCAL_NETWORKS="${LOCAL_NETWORKS:-}"
+POLICY_E2E="${POLICY_E2E:-}"
 
 # IPv6 configuration (optional)
 # CLIENT_IPV6: y/n to enable IPv6 for VPN clients
@@ -94,6 +115,18 @@ INSTALL_CMD+=(--dns unbound)
 INSTALL_CMD+=(--subnet-ipv4 "$VPN_SUBNET_IPV4")
 INSTALL_CMD+=(--mtu 1400)
 INSTALL_CMD+=(--client testclient)
+
+if [ "$ROUTE_INTERNET" = "n" ]; then
+	INSTALL_CMD+=(--no-route-internet)
+fi
+if [ "$CLIENT_TO_CLIENT" = "y" ]; then
+	INSTALL_CMD+=(--client-to-client)
+fi
+if [ -n "$LOCAL_NETWORKS" ]; then
+	while IFS= read -r local_network; do
+		INSTALL_CMD+=(--local-network "$local_network")
+	done < <(tr ',' '\n' <<<"$LOCAL_NETWORKS")
+fi
 
 # Add IPv6 client support if enabled
 if [ "$CLIENT_IPV6" = "y" ]; then
@@ -198,6 +231,65 @@ fi
 echo "All required files present"
 
 # =====================================================
+# Verify access policy configuration
+# =====================================================
+echo ""
+echo "=== Verifying Access Policy Configuration ==="
+
+if [ "$ROUTE_INTERNET" = "y" ]; then
+	if grep -q '^push "redirect-gateway def1 bypass-dhcp"' /etc/openvpn/server/server.conf; then
+		echo "PASS: Internet default route is pushed"
+	else
+		echo "FAIL: Internet default route is missing"
+		exit 1
+	fi
+else
+	if grep -q 'redirect-gateway\|block-ipv6' /etc/openvpn/server/server.conf; then
+		echo "FAIL: Internet or leak-blocking routes exist in split-tunnel mode"
+		exit 1
+	fi
+	echo "PASS: Client internet routes remain outside the VPN"
+fi
+
+if [ "$CLIENT_TO_CLIENT" = "y" ]; then
+	grep -q '^client-to-client$' /etc/openvpn/server/server.conf || {
+		echo "FAIL: client-to-client directive is missing"
+		exit 1
+	}
+else
+	if grep -q '^client-to-client$' /etc/openvpn/server/server.conf; then
+		echo "FAIL: client-to-client is enabled by default"
+		exit 1
+	fi
+fi
+
+if [ -n "$LOCAL_NETWORKS" ]; then
+	while IFS= read -r local_network; do
+		if [[ $local_network == *.* ]]; then
+			local_address="${local_network%/*}"
+			grep -q "^push \"route $local_address " /etc/openvpn/server/server.conf || {
+				echo "FAIL: Local IPv4 route for $local_network is missing"
+				exit 1
+			}
+		else
+			grep -q "^push \"route-ipv6 $local_network\"" /etc/openvpn/server/server.conf || {
+				echo "FAIL: Local IPv6 route for $local_network is missing"
+				exit 1
+			}
+		fi
+	done < <(tr ',' '\n' <<<"$LOCAL_NETWORKS")
+fi
+
+for setting in "ROUTE_INTERNET=$ROUTE_INTERNET" "CLIENT_TO_CLIENT=$CLIENT_TO_CLIENT" "LOCAL_NETWORKS=$LOCAL_NETWORKS"; do
+	grep -Fxq "$setting" /etc/openvpn/server/openvpn-install.conf || {
+		echo "FAIL: Policy manifest is missing $setting"
+		exit 1
+	}
+done
+
+echo "PASS: Access policy configuration is correct"
+
+# =====================================================
 # Verify management interface configuration
 # =====================================================
 echo ""
@@ -253,6 +345,17 @@ else
 	exit 1
 fi
 
+if [ -n "$POLICY_E2E" ]; then
+	echo "Creating second VPN client for packet-level policy tests..."
+	bash /opt/openvpn-install.sh client add policy-peer --cert-days 3650
+	if [ ! -f /root/policy-peer.ovpn ]; then
+		echo "FAIL: Policy peer client configuration was not generated"
+		exit 1
+	fi
+	cp /root/policy-peer.ovpn /shared/policy-peer.ovpn
+	sed -i 's/^remote .*/remote openvpn-server 1194/' /shared/policy-peer.ovpn
+fi
+
 # Copy client config to shared volume for initial connectivity tests
 cp /root/testclient.ovpn /shared/client.ovpn
 sed -i 's/^remote .*/remote openvpn-server 1194/' /shared/client.ovpn
@@ -264,6 +367,9 @@ echo "Client config copied to /shared/client.ovpn"
 	echo "VPN_GATEWAY=$VPN_GATEWAY"
 	echo "CLIENT_IPV6=$CLIENT_IPV6"
 	echo "AUTH_MODE=$AUTH_MODE"
+	echo "ROUTE_INTERNET=$ROUTE_INTERNET"
+	echo "CLIENT_TO_CLIENT=$CLIENT_TO_CLIENT"
+	echo "LOCAL_NETWORKS=$LOCAL_NETWORKS"
 	if [ "$CLIENT_IPV6" = "y" ]; then
 		echo "VPN_SUBNET_IPV6=$VPN_SUBNET_IPV6"
 		echo "VPN_GATEWAY_IPV6=$VPN_GATEWAY_IPV6"
@@ -599,64 +705,72 @@ echo "Post-renewal client tests passed"
 # =====================================================
 # Verify Unbound DNS resolver (started by systemd via install script)
 # =====================================================
-echo "=== Verifying Unbound DNS Resolver ==="
+if [ "$ROUTE_INTERNET" = "y" ]; then
+	echo "=== Verifying Unbound DNS Resolver ==="
 
-if [ -f /etc/unbound/unbound.conf ]; then
-	# Verify Unbound is running (started by systemctl in install script)
-	echo "Checking Unbound service status..."
-	for _ in $(seq 1 30); do
-		if pgrep -x unbound >/dev/null; then
-			echo "PASS: Unbound is running"
-			break
+	if [ -f /etc/unbound/unbound.conf ]; then
+		# Verify Unbound is running (started by systemctl in install script)
+		echo "Checking Unbound service status..."
+		for _ in $(seq 1 30); do
+			if pgrep -x unbound >/dev/null; then
+				echo "PASS: Unbound is running"
+				break
+			fi
+			sleep 1
+		done
+		if ! pgrep -x unbound >/dev/null; then
+			echo "FAIL: Unbound is not running"
+			systemctl status unbound 2>&1 || true
+			journalctl -u unbound --no-pager -n 50 2>&1 || true
+			exit 1
 		fi
-		sleep 1
-	done
-	if ! pgrep -x unbound >/dev/null; then
-		echo "FAIL: Unbound is not running"
-		systemctl status unbound 2>&1 || true
-		journalctl -u unbound --no-pager -n 50 2>&1 || true
+	else
+		echo "FAIL: /etc/unbound/unbound.conf not found"
 		exit 1
 	fi
+
+	echo ""
+	echo "=== Verifying Unbound Installation ==="
+
+	# Verify Unbound config exists in conf.d directory
+	UNBOUND_OPENVPN_CONF="/etc/unbound/unbound.conf.d/openvpn.conf"
+	if [ -f "$UNBOUND_OPENVPN_CONF" ]; then
+		echo "PASS: Found Unbound config at $UNBOUND_OPENVPN_CONF"
+	else
+		echo "FAIL: OpenVPN Unbound config not found at $UNBOUND_OPENVPN_CONF"
+		echo "Contents of /etc/unbound/:"
+		ls -la /etc/unbound/
+		ls -la /etc/unbound/unbound.conf.d/ 2>/dev/null || true
+		exit 1
+	fi
+
+	# Verify Unbound listens on VPN gateway
+	if grep -q "interface: $VPN_GATEWAY" "$UNBOUND_OPENVPN_CONF"; then
+		echo "PASS: Unbound configured to listen on $VPN_GATEWAY"
+	else
+		echo "FAIL: Unbound not configured for $VPN_GATEWAY"
+		cat "$UNBOUND_OPENVPN_CONF"
+		exit 1
+	fi
+
+	# Verify OpenVPN pushes correct DNS
+	if grep -q "push \"dhcp-option DNS $VPN_GATEWAY\"" /etc/openvpn/server/server.conf; then
+		echo "PASS: OpenVPN configured to push Unbound DNS"
+	else
+		echo "FAIL: OpenVPN not configured to push Unbound DNS"
+		grep "dhcp-option DNS" /etc/openvpn/server/server.conf || echo "No DNS push found"
+		exit 1
+	fi
+
+	echo "=== Unbound Installation Verified ==="
+	echo ""
 else
-	echo "FAIL: /etc/unbound/unbound.conf not found"
-	exit 1
+	if grep -q '^push "dhcp-option DNS ' /etc/openvpn/server/server.conf; then
+		echo "FAIL: DNS is pushed while internet routing is disabled"
+		exit 1
+	fi
+	echo "PASS: VPN DNS setup is skipped in split-tunnel mode"
 fi
-
-echo ""
-echo "=== Verifying Unbound Installation ==="
-
-# Verify Unbound config exists in conf.d directory
-UNBOUND_OPENVPN_CONF="/etc/unbound/unbound.conf.d/openvpn.conf"
-if [ -f "$UNBOUND_OPENVPN_CONF" ]; then
-	echo "PASS: Found Unbound config at $UNBOUND_OPENVPN_CONF"
-else
-	echo "FAIL: OpenVPN Unbound config not found at $UNBOUND_OPENVPN_CONF"
-	echo "Contents of /etc/unbound/:"
-	ls -la /etc/unbound/
-	ls -la /etc/unbound/unbound.conf.d/ 2>/dev/null || true
-	exit 1
-fi
-
-# Verify Unbound listens on VPN gateway
-if grep -q "interface: $VPN_GATEWAY" "$UNBOUND_OPENVPN_CONF"; then
-	echo "PASS: Unbound configured to listen on $VPN_GATEWAY"
-else
-	echo "FAIL: Unbound not configured for $VPN_GATEWAY"
-	cat "$UNBOUND_OPENVPN_CONF"
-	exit 1
-fi
-
-# Verify OpenVPN pushes correct DNS
-if grep -q "push \"dhcp-option DNS $VPN_GATEWAY\"" /etc/openvpn/server/server.conf; then
-	echo "PASS: OpenVPN configured to push Unbound DNS"
-else
-	echo "FAIL: OpenVPN not configured to push Unbound DNS"
-	grep "dhcp-option DNS" /etc/openvpn/server/server.conf || echo "No DNS push found"
-	exit 1
-fi
-
-echo "=== Unbound Installation Verified ==="
-echo ""
 
 # Verify OpenVPN server (started by systemd via install script)
 echo "Verifying OpenVPN server..."
@@ -664,36 +778,49 @@ echo "Verifying OpenVPN server..."
 # Verify firewall rules exist
 echo "Verifying firewall rules..."
 if systemctl is-active --quiet firewalld; then
-	# firewalld is active - verify masquerade is enabled
-	echo "firewalld detected, checking masquerade..."
-	for _ in $(seq 1 10); do
-		if firewall-cmd --query-masquerade 2>/dev/null; then
-			echo "PASS: firewalld masquerade is enabled"
-			break
-		fi
-		sleep 1
-	done
-	if ! firewall-cmd --query-masquerade 2>/dev/null; then
-		echo "FAIL: firewalld masquerade is not enabled"
-		echo "Current firewalld config:"
-		firewall-cmd --list-all 2>&1 || true
+	echo "firewalld detected, checking scoped policy rules..."
+	if ! firewall-cmd --get-policies | grep -qw openvpn-egress; then
+		echo "FAIL: firewalld OpenVPN policy is missing"
 		exit 1
 	fi
-	# Verify port is open
+	if ! firewall-cmd --zone=openvpn-install --query-source="$VPN_SUBNET_IPV4/24"; then
+		echo "FAIL: firewalld OpenVPN source zone is missing"
+		exit 1
+	fi
+	if [ "$(firewall-cmd --permanent --policy=openvpn-egress --get-target)" != "DROP" ]; then
+		echo "FAIL: firewalld OpenVPN policy does not default to DROP"
+		exit 1
+	fi
+	FIREWALLD_POLICY_RULES=$(firewall-cmd --policy=openvpn-egress --list-rich-rules)
+	if [ "$ROUTE_INTERNET" = "y" ]; then
+		if grep -q 'family="ipv4" masquerade' <<<"$FIREWALLD_POLICY_RULES"; then
+			echo "PASS: firewalld has policy-scoped internet NAT"
+		else
+			echo "FAIL: firewalld policy-scoped internet NAT is missing"
+			printf '%s\n' "$FIREWALLD_POLICY_RULES"
+			exit 1
+		fi
+		if grep -q 'destination address="10.0.0.0/8" reject' <<<"$FIREWALLD_POLICY_RULES"; then
+			echo "PASS: firewalld private-network isolation is configured"
+		else
+			echo "FAIL: firewalld private-network isolation is missing"
+			printf '%s\n' "$FIREWALLD_POLICY_RULES"
+			exit 1
+		fi
+	fi
+	if [ "$CLIENT_TO_CLIENT" = "y" ] && ! firewall-cmd --zone=openvpn-install --query-forward; then
+		echo "FAIL: firewalld client-to-client forwarding is missing"
+		exit 1
+	fi
+	if firewall-cmd --query-masquerade 2>/dev/null; then
+		echo "FAIL: firewalld zone-wide masquerade should not be enabled"
+		exit 1
+	fi
 	if firewall-cmd --list-ports | grep -q "1194/udp"; then
 		echo "PASS: OpenVPN port is open in firewalld"
 	else
 		echo "FAIL: OpenVPN port not found in firewalld"
 		firewall-cmd --list-ports
-		exit 1
-	fi
-	# Verify VPN subnet rich rule exists (source-based rules work reliably across firewalld backends)
-	if firewall-cmd --list-rich-rules | grep -q "source address=\"$VPN_SUBNET_IPV4/24\""; then
-		echo "PASS: VPN subnet rich rule is configured"
-	else
-		echo "FAIL: VPN subnet rich rule not found in firewalld"
-		echo "Current rich rules:"
-		firewall-cmd --list-rich-rules
 		exit 1
 	fi
 elif systemctl is-active --quiet nftables; then
@@ -712,20 +839,25 @@ elif systemctl is-active --quiet nftables; then
 		nft list ruleset 2>&1 || true
 		exit 1
 	fi
-	# Verify NAT table exists
-	if nft list table ip openvpn-nat >/dev/null 2>&1; then
-		echo "PASS: nftables 'ip openvpn-nat' table exists"
-	else
-		echo "FAIL: nftables 'ip openvpn-nat' table not found"
-		nft list ruleset 2>&1 || true
-		exit 1
+	if [ "$ROUTE_INTERNET" = "y" ] || [ -n "$LOCAL_NETWORKS" ]; then
+		if nft list table ip openvpn-nat >/dev/null 2>&1 && nft list table ip openvpn-nat | grep -q "masquerade"; then
+			echo "PASS: nftables scoped NAT is configured"
+		else
+			echo "FAIL: nftables scoped NAT is missing"
+			nft list ruleset 2>&1 || true
+			exit 1
+		fi
 	fi
-	# Verify masquerade rule exists
-	if nft list table ip openvpn-nat | grep -q "masquerade"; then
-		echo "PASS: nftables masquerade rule exists"
-	else
-		echo "FAIL: nftables masquerade rule not found"
-		nft list table ip openvpn-nat 2>&1 || true
+	if [ "$ROUTE_INTERNET" = "y" ]; then
+		if nft list table inet openvpn | grep -q "ip daddr 10.0.0.0/8 drop"; then
+			echo "PASS: nftables private-network isolation is configured"
+		else
+			echo "FAIL: nftables private-network isolation is missing"
+			nft list table inet openvpn
+			exit 1
+		fi
+	elif ! nft list table inet openvpn | grep -q "ip saddr $VPN_SUBNET_IPV4/24 drop"; then
+		echo "FAIL: nftables split-tunnel default drop is missing"
 		exit 1
 	fi
 	# Verify include in nftables.conf
@@ -737,20 +869,32 @@ elif systemctl is-active --quiet nftables; then
 		exit 1
 	fi
 else
-	# iptables mode - verify NAT rules
-	echo "iptables mode, checking NAT rules..."
-	for _ in $(seq 1 10); do
-		if iptables -t nat -L POSTROUTING -n | grep -q "$VPN_SUBNET_IPV4"; then
-			echo "PASS: NAT POSTROUTING rule for $VPN_SUBNET_IPV4/24 exists"
-			break
+	echo "iptables mode, checking policy rules..."
+	if [ "$ROUTE_INTERNET" = "y" ] || [ -n "$LOCAL_NETWORKS" ]; then
+		for _ in $(seq 1 10); do
+			iptables -t nat -L POSTROUTING -n | grep -q "$VPN_SUBNET_IPV4" && break
+			sleep 1
+		done
+		if ! iptables -t nat -L POSTROUTING -n | grep -q "$VPN_SUBNET_IPV4"; then
+			echo "FAIL: Expected scoped NAT rule was not found"
+			iptables -t nat -L POSTROUTING -n -v
+			exit 1
 		fi
-		sleep 1
-	done
-	if ! iptables -t nat -L POSTROUTING -n | grep -q "$VPN_SUBNET_IPV4"; then
-		echo "FAIL: NAT POSTROUTING rule for $VPN_SUBNET_IPV4/24 not found"
-		echo "Current NAT rules:"
-		iptables -t nat -L POSTROUTING -n -v
-		systemctl status iptables-openvpn 2>&1 || true
+	fi
+	if [ "$ROUTE_INTERNET" = "y" ]; then
+		if iptables -S OPENVPN_INSTALL_FORWARD | grep -q -- "-d 10.0.0.0/8 -j REJECT"; then
+			echo "PASS: iptables private-network isolation is configured"
+		else
+			echo "FAIL: iptables private-network isolation is missing"
+			iptables -S OPENVPN_INSTALL_FORWARD
+			exit 1
+		fi
+	elif ! iptables -S OPENVPN_INSTALL_FORWARD | grep -q -- "-A OPENVPN_INSTALL_FORWARD -j REJECT"; then
+		echo "FAIL: iptables split-tunnel default reject is missing"
+		exit 1
+	fi
+	if [ "$CLIENT_TO_CLIENT" = "y" ] && ! iptables -S OPENVPN_INSTALL_FORWARD | grep -q -- "-d $VPN_SUBNET_IPV4/24 -j ACCEPT"; then
+		echo "FAIL: iptables client-to-client allow rule is missing"
 		exit 1
 	fi
 fi
@@ -930,10 +1074,8 @@ echo "=== Certificate Revocation Tests PASSED ==="
 echo ""
 echo "=== Testing List Client Certificates ==="
 
-# At this point we have 3 client certificates:
-# - testclient (Valid) - the renewed certificate
-# - testclient (Revoked) - the old certificate revoked during renewal
-# - revoketest (Revoked) - the revoked certificate
+# At this point PKI mode has three lifecycle-test certificates, plus the
+# optional policy peer used by packet-level access tests.
 LIST_OUTPUT="/tmp/list-clients-output.log"
 (bash /opt/openvpn-install.sh client list) 2>&1 | tee "$LIST_OUTPUT" || true
 
@@ -956,8 +1098,9 @@ fi
 
 # Verify certificate count (varies by auth mode)
 if [ "$AUTH_MODE" = "pki" ]; then
-	# PKI mode: 3 certs (testclient valid, testclient revoked from renewal, revoketest revoked)
-	if grep -q "Found 3 client certificate(s)" "$LIST_OUTPUT"; then
+	EXPECTED_CLIENT_COUNT=3
+	[ -n "$POLICY_E2E" ] && EXPECTED_CLIENT_COUNT=4
+	if grep -q "Found $EXPECTED_CLIENT_COUNT client certificate(s)" "$LIST_OUTPUT"; then
 		echo "PASS: List shows correct certificate count"
 	else
 		echo "FAIL: List does not show correct certificate count"
@@ -993,10 +1136,10 @@ fi
 # Verify client count in JSON (varies by auth mode)
 JSON_CLIENT_COUNT=$(jq '.clients | length' "$LIST_JSON_OUTPUT")
 if [ "$AUTH_MODE" = "pki" ]; then
-	if [ "$JSON_CLIENT_COUNT" -eq 3 ]; then
+	if [ "$JSON_CLIENT_COUNT" -eq "$EXPECTED_CLIENT_COUNT" ]; then
 		echo "PASS: Client list JSON has correct count ($JSON_CLIENT_COUNT)"
 	else
-		echo "FAIL: Client list JSON has wrong count: $JSON_CLIENT_COUNT (expected 3)"
+		echo "FAIL: Client list JSON has wrong count: $JSON_CLIENT_COUNT (expected $EXPECTED_CLIENT_COUNT)"
 		cat "$LIST_JSON_OUTPUT"
 		exit 1
 	fi

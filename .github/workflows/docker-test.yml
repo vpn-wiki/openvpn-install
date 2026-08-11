@@ -30,6 +30,7 @@ jobs:
             image: ubuntu:22.04
           - name: ubuntu-24.04
             image: ubuntu:24.04
+            policy_e2e: deny
           - name: ubuntu-25.10
             image: ubuntu:25.10
           - name: debian-11
@@ -98,6 +99,7 @@ jobs:
               name: fedora-42-firewalld
               image: fedora:42
               enable_firewalld: true
+              policy_e2e: deny
             tls:
               name: tls-crypt-v2
               sig: crypt-v2
@@ -107,6 +109,7 @@ jobs:
               name: debian-12-nftables
               image: debian:12
               enable_nftables: true
+              policy_e2e: deny
             tls:
               name: tls-crypt-v2
               sig: crypt-v2
@@ -125,6 +128,42 @@ jobs:
               name: ubuntu-24.04-fingerprint
               image: ubuntu:24.04
               auth_mode: fingerprint
+            tls:
+              name: tls-crypt-v2
+              sig: crypt-v2
+              key_file: tls-crypt-v2.key
+          # Test split tunnel with packet-level peer and home-LAN access
+          - os:
+              name: ubuntu-24.04-access-policy
+              image: ubuntu:24.04
+              route_internet: n
+              client_to_client: y
+              local_networks: 10.55.0.0/24
+              policy_e2e: allow
+            tls:
+              name: tls-crypt-v2
+              sig: crypt-v2
+              key_file: tls-crypt-v2.key
+          - os:
+              name: fedora-42-firewalld-access-policy
+              image: fedora:42
+              enable_firewalld: true
+              route_internet: n
+              client_to_client: y
+              local_networks: 10.55.0.0/24
+              policy_e2e: allow
+            tls:
+              name: tls-crypt-v2
+              sig: crypt-v2
+              key_file: tls-crypt-v2.key
+          - os:
+              name: debian-12-nftables-access-policy
+              image: debian:12
+              enable_nftables: true
+              route_internet: n
+              client_to_client: y
+              local_networks: 10.55.0.0/24
+              policy_e2e: allow
             tls:
               name: tls-crypt-v2
               sig: crypt-v2
@@ -154,12 +193,24 @@ jobs:
       - name: Create Docker network
         run: docker network create --subnet=172.28.0.0/24 vpn-test
 
+      - name: Create policy test LAN
+        if: matrix.os.policy_e2e != ''
+        run: |
+          docker network create --subnet=10.55.0.0/24 policy-lan
+          docker run -d \
+            --name policy-lan-target \
+            --network policy-lan \
+            --ip 10.55.0.20 \
+            --entrypoint sleep \
+            openvpn-client infinity
+
       - name: Create shared volume
         run: docker volume create shared-config
 
       - name: Start OpenVPN server
         run: |
-          docker run -d \
+          POLICY_E2E=${{ matrix.os.policy_e2e || '' }}
+          docker create \
             --name openvpn-server \
             --hostname openvpn-server \
             --privileged \
@@ -178,7 +229,16 @@ jobs:
             -e TLS_KEY_FILE=${{ matrix.tls.key_file }} \
             -e CLIENT_IPV6=${{ matrix.os.client_ipv6 && 'y' || 'n' }} \
             -e AUTH_MODE=${{ matrix.os.auth_mode || 'pki' }} \
+            -e ROUTE_INTERNET=${{ matrix.os.route_internet || 'y' }} \
+            -e CLIENT_TO_CLIENT=${{ matrix.os.client_to_client || 'n' }} \
+            -e LOCAL_NETWORKS=${{ matrix.os.local_networks || '' }} \
+            -e POLICY_E2E="$POLICY_E2E" \
             openvpn-server
+
+          if [ -n "$POLICY_E2E" ]; then
+            docker network connect --ip 10.55.0.10 --gw-priority -1 policy-lan openvpn-server
+          fi
+          docker start openvpn-server
 
       - name: Wait for server installation and startup
         run: |
@@ -252,6 +312,21 @@ jobs:
           docker run --rm -v shared-config:/shared alpine \
             cat /shared/client.ovpn
 
+      - name: Start policy test peer
+        if: matrix.os.policy_e2e != ''
+        run: |
+          docker exec policy-lan-target ping -c 3 -W 2 10.55.0.10
+          docker run -d \
+            --name policy-peer \
+            --hostname policy-peer \
+            --cap-add=NET_ADMIN \
+            --device=/dev/net/tun:/dev/net/tun \
+            --network vpn-test \
+            --ip 172.28.0.30 \
+            -v shared-config:/shared \
+            --entrypoint /policy-peer-entrypoint.sh \
+            openvpn-client
+
       - name: Start OpenVPN client and run tests
         run: |
           docker run \
@@ -262,6 +337,8 @@ jobs:
             --network vpn-test \
             --ip 172.28.0.20 \
             -v shared-config:/shared \
+            -e POLICY_E2E=${{ matrix.os.policy_e2e || '' }} \
+            -e POLICY_LAN_IP=10.55.0.20 \
             openvpn-client &
 
           # Wait for tests to complete (look for success message)
@@ -309,12 +386,14 @@ jobs:
 
       - name: Show client logs
         if: always()
-        run: docker logs openvpn-client 2>&1 || true
+        run: |
+          docker logs openvpn-client 2>&1 || true
+          docker logs policy-peer 2>&1 || true
 
       - name: Cleanup
         if: always()
         run: |
-          docker stop openvpn-server openvpn-client 2>/dev/null || true
-          docker rm openvpn-server openvpn-client 2>/dev/null || true
-          docker network rm vpn-test 2>/dev/null || true
+          docker stop openvpn-server openvpn-client policy-peer policy-lan-target 2>/dev/null || true
+          docker rm openvpn-server openvpn-client policy-peer policy-lan-target 2>/dev/null || true
+          docker network rm vpn-test policy-lan 2>/dev/null || true
           docker volume rm shared-config 2>/dev/null || true

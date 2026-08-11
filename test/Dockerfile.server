@@ -68,7 +68,9 @@ RUN chmod +x /opt/openvpn-install.sh
 # Copy test scripts
 COPY test/server-entrypoint.sh /entrypoint.sh
 COPY test/validate-output.sh /opt/test/validate-output.sh
-RUN chmod +x /entrypoint.sh /opt/test/validate-output.sh
+COPY test/interactive-install-routing.sh /opt/test/interactive-install-routing.sh
+COPY test/local-network-detection.sh /opt/test/local-network-detection.sh
+RUN chmod +x /entrypoint.sh /opt/test/validate-output.sh /opt/test/interactive-install-routing.sh /opt/test/local-network-detection.sh
 
 # Create systemd service for the test script
 # PassEnvironment passes Docker env vars (-e) from PID 1 to the service
@@ -80,7 +82,7 @@ RUN printf '%s\n' \
     '[Service]' \
     'Type=oneshot' \
     'Environment=HOME=/root' \
-    'PassEnvironment=AUTH_MODE TLS_SIG TLS_KEY_FILE TLS_VERSION_MIN TLS13_CIPHERSUITES CLIENT_IPV6 VPN_SUBNET_IPV6 WAIT_TIMEOUT_SIGNAL WAIT_TIMEOUT_CONNECT WAIT_TIMEOUT_REVOKE' \
+    'PassEnvironment=AUTH_MODE TLS_SIG TLS_KEY_FILE TLS_VERSION_MIN TLS13_CIPHERSUITES CLIENT_IPV6 VPN_SUBNET_IPV6 ROUTE_INTERNET CLIENT_TO_CLIENT LOCAL_NETWORKS POLICY_E2E WAIT_TIMEOUT_SIGNAL WAIT_TIMEOUT_CONNECT WAIT_TIMEOUT_REVOKE' \
     'WorkingDirectory=/root' \
     'ExecStart=/entrypoint.sh' \
     'RemainAfterExit=yes' \

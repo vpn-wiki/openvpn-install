@@ -213,6 +213,11 @@ show_install_help() {
 			--no-client-ipv6      Disable IPv6 for VPN clients (default)
 			--subnet-ipv4 <x.x.x.0>  IPv4 VPN subnet (default: 10.8.0.0)
 			--subnet-ipv6 <prefix>   IPv6 VPN subnet (default: fd42:42:42:42::)
+			--route-internet      Route client internet traffic through VPN (default)
+			--no-route-internet   Keep client internet traffic outside VPN
+			--client-to-client    Allow VPN clients to access each other
+			--no-client-to-client Isolate VPN clients from each other (default)
+			--local-network <CIDR>  Allow access to a server-side network (repeatable)
 			--port <num>          OpenVPN port (default: 1194)
 			--port-random         Use random port (49152-65535)
 			--protocol <proto>    Protocol: udp or tcp (default: udp)
@@ -486,6 +491,11 @@ readonly AUTH_MODES=("pki" "fingerprint")
 # HMAC algorithms
 readonly HMAC_ALGS=("SHA256" "SHA384" "SHA512")
 
+# Networks that internet access must not implicitly expose. Explicit local
+# networks are allowed before these deny rules are evaluated.
+readonly PROTECTED_IPV4_NETWORKS=("10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.168.0.0/16")
+readonly PROTECTED_IPV6_NETWORKS=("::1/128" "fc00::/7" "fe80::/10")
+
 # TLS 1.3 cipher suite options
 readonly TLS13_OPTIONS=("all" "aes-256-only" "aes-128-only" "chacha20-only")
 
@@ -503,6 +513,9 @@ set_installation_defaults() {
 	CLIENT_IPV6="${CLIENT_IPV6:-n}"
 	VPN_SUBNET_IPV4="${VPN_SUBNET_IPV4:-10.8.0.0}"
 	VPN_SUBNET_IPV6="${VPN_SUBNET_IPV6:-fd42:42:42:42::}"
+	ROUTE_INTERNET="${ROUTE_INTERNET:-y}"
+	CLIENT_TO_CLIENT="${CLIENT_TO_CLIENT:-n}"
+	LOCAL_NETWORKS="${LOCAL_NETWORKS:-}"
 	PORT="${PORT:-1194}"
 	PROTOCOL="${PROTOCOL:-udp}"
 
@@ -597,6 +610,281 @@ validate_subnet_ipv6() {
 	fi
 }
 
+is_valid_ipv4_cidr() {
+	local cidr="$1" address prefix extra
+	local -a octets
+
+	[[ $cidr == */* ]] || return 1
+	address="${cidr%/*}"
+	prefix="${cidr##*/}"
+	[[ $prefix =~ ^(0|[1-9][0-9]?)$ ]] || return 1
+	prefix=$((10#$prefix))
+	((prefix >= 1 && prefix <= 32)) || return 1
+
+	IFS='.' read -r -a octets <<<"$address"
+	[[ ${#octets[@]} -eq 4 ]] || return 1
+	for extra in "${octets[@]}"; do
+		[[ $extra =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+		extra=$((10#$extra))
+		((extra >= 0 && extra <= 255)) || return 1
+	done
+
+	local ip mask
+	ip=$(((10#${octets[0]} << 24) | (10#${octets[1]} << 16) | (10#${octets[2]} << 8) | 10#${octets[3]}))
+	if ((prefix == 0)); then
+		mask=0
+	else
+		mask=$(((0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF))
+	fi
+	(((ip & mask) == ip))
+}
+
+expand_ipv6_address() {
+	local address="$1"
+	local -n result_ref="$2"
+	local left right remainder part
+	local -a left_parts=() right_parts=()
+
+	[[ $address == *:* ]] || return 1
+	[[ $address =~ ^[0-9a-fA-F:]+$ ]] || return 1
+
+	if [[ $address == *::* ]]; then
+		remainder="${address#*::}"
+		[[ $remainder != *::* ]] || return 1
+		left="${address%%::*}"
+		right="${address#*::}"
+		[[ -z $left ]] || IFS=':' read -r -a left_parts <<<"$left"
+		[[ -z $right ]] || IFS=':' read -r -a right_parts <<<"$right"
+		((${#left_parts[@]} + ${#right_parts[@]} < 8)) || return 1
+	else
+		IFS=':' read -r -a left_parts <<<"$address"
+		[[ ${#left_parts[@]} -eq 8 ]] || return 1
+	fi
+
+	for part in "${left_parts[@]}" "${right_parts[@]}"; do
+		[[ $part =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+	done
+
+	result_ref=()
+	for part in "${left_parts[@]}"; do
+		result_ref+=("$((16#$part))")
+	done
+	while ((${#result_ref[@]} + ${#right_parts[@]} < 8)); do
+		result_ref+=(0)
+	done
+	for part in "${right_parts[@]}"; do
+		result_ref+=("$((16#$part))")
+	done
+	[[ ${#result_ref[@]} -eq 8 ]]
+}
+
+is_valid_ipv6_cidr() {
+	local cidr="$1" address prefix_text prefix index remaining host_mask
+	local -a hextets
+
+	[[ $cidr == */* ]] || return 1
+	address="${cidr%/*}"
+	prefix_text="${cidr##*/}"
+	[[ $prefix_text =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+	prefix=$((10#$prefix_text))
+	((prefix >= 1 && prefix <= 128)) || return 1
+	expand_ipv6_address "$address" hextets || return 1
+
+	remaining=$prefix
+	for index in "${!hextets[@]}"; do
+		if ((remaining >= 16)); then
+			remaining=$((remaining - 16))
+		elif ((remaining <= 0)); then
+			((hextets[index] == 0)) || return 1
+		else
+			host_mask=$(((1 << (16 - remaining)) - 1))
+			(((hextets[index] & host_mask) == 0)) || return 1
+			remaining=0
+		fi
+	done
+}
+
+is_valid_local_network() {
+	is_valid_ipv4_cidr "$1" || is_valid_ipv6_cidr "$1"
+}
+
+is_private_ipv4_network() {
+	local cidr="$1" address prefix first second
+	is_valid_ipv4_cidr "$cidr" || return 1
+
+	address="${cidr%/*}"
+	prefix=$((10#${cidr##*/}))
+	IFS='.' read -r first second _ <<<"$address"
+
+	case "$first" in
+	10)
+		((prefix >= 8))
+		;;
+	172)
+		((second >= 16 && second <= 31 && prefix >= 12))
+		;;
+	192)
+		((second == 168 && prefix >= 16))
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
+is_private_ipv6_network() {
+	local cidr="$1" address prefix
+	local -a hextets
+	is_valid_ipv6_cidr "$cidr" || return 1
+
+	address="${cidr%/*}"
+	prefix=$((10#${cidr##*/}))
+	expand_ipv6_address "$address" hextets || return 1
+	((prefix >= 7 && (hextets[0] & 0xFE00) == 0xFC00))
+}
+
+interface_has_public_ipv4() {
+	local interface="$1" address
+	while read -r _ _ _ address _; do
+		[[ -n $address ]] || continue
+		is_private_ipv4_network "${address%/*}/32" || return 0
+	done < <(ip -4 -o address show dev "$interface" scope global 2>/dev/null || true)
+	return 1
+}
+
+detect_private_local_networks() {
+	local detect_ipv4="${1:-y}" detect_ipv6="${2:-y}" route network interface
+	local -a detected_networks=()
+
+	if [[ $detect_ipv4 == "y" ]]; then
+		while IFS= read -r route; do
+			[[ " $route " == *" via "* ]] && continue
+			network="${route%% *}"
+			is_private_ipv4_network "$network" || continue
+			[[ $route == *" dev "* ]] || continue
+			interface="${route#* dev }"
+			interface="${interface%% *}"
+			interface_has_public_ipv4 "$interface" && continue
+			if [[ -n ${VPN_SUBNET_IPV4:-} ]] && ipv4_cidrs_overlap "$network" "${VPN_SUBNET_IPV4}/24"; then
+				continue
+			fi
+			if ((${#detected_networks[@]} == 0)) || [[ " ${detected_networks[*]} " != *" $network "* ]]; then
+				detected_networks+=("$network")
+			fi
+		done < <(ip -4 -o route show type unicast 2>/dev/null || true)
+	fi
+
+	if [[ $detect_ipv6 == "y" ]]; then
+		while IFS= read -r route; do
+			[[ " $route " == *" via "* ]] && continue
+			network="${route%% *}"
+			is_private_ipv6_network "$network" || continue
+			if [[ -n ${VPN_SUBNET_IPV6:-} ]] && ipv6_cidrs_overlap "$network" "${VPN_SUBNET_IPV6}/112"; then
+				continue
+			fi
+			if ((${#detected_networks[@]} == 0)) || [[ " ${detected_networks[*]} " != *" $network "* ]]; then
+				detected_networks+=("$network")
+			fi
+		done < <(ip -6 -o route show type unicast 2>/dev/null || true)
+	fi
+
+	((${#detected_networks[@]} > 0)) || return 0
+	local IFS=,
+	printf '%s\n' "${detected_networks[*]}"
+}
+
+add_local_network() {
+	local network="${1//[[:space:]]/}"
+	is_valid_local_network "$network" || log_fatal "Invalid local network: $1. Use a network CIDR such as 192.168.1.0/24 or fd00:1::/64."
+
+	if [[ -z $LOCAL_NETWORKS ]]; then
+		LOCAL_NETWORKS="$network"
+	elif [[ ",$LOCAL_NETWORKS," != *",$network,"* ]]; then
+		LOCAL_NETWORKS+=",$network"
+	fi
+}
+
+normalize_local_networks() {
+	local configured="${LOCAL_NETWORKS//[[:space:]]/}" network
+	LOCAL_NETWORKS=""
+	[[ -z $configured ]] && return
+
+	while IFS= read -r network; do
+		add_local_network "$network"
+	done < <(tr ',' '\n' <<<"$configured")
+}
+
+local_networks_for_family() {
+	local family="$1" network
+	[[ -z $LOCAL_NETWORKS ]] && return
+
+	while IFS= read -r network; do
+		if [[ $family == "4" && $network == *.* ]] || [[ $family == "6" && $network == *:* ]]; then
+			echo "$network"
+		fi
+	done < <(tr ',' '\n' <<<"$LOCAL_NETWORKS")
+}
+
+has_local_network_family() {
+	[[ -n $(local_networks_for_family "$1") ]]
+}
+
+ipv4_prefix_to_netmask() {
+	local prefix="$1" mask
+	if ((prefix == 0)); then
+		mask=0
+	else
+		mask=$(((0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF))
+	fi
+	printf '%d.%d.%d.%d\n' \
+		$(((mask >> 24) & 255)) \
+		$(((mask >> 16) & 255)) \
+		$(((mask >> 8) & 255)) \
+		$((mask & 255))
+}
+
+ipv4_cidrs_overlap() {
+	local first="$1" second="$2" first_address second_address first_prefix second_prefix prefix mask
+	local -a first_octets second_octets
+	first_address="${first%/*}"
+	second_address="${second%/*}"
+	first_prefix=$((10#${first##*/}))
+	second_prefix=$((10#${second##*/}))
+	prefix=$first_prefix
+	((second_prefix < prefix)) && prefix=$second_prefix
+	IFS='.' read -r -a first_octets <<<"$first_address"
+	IFS='.' read -r -a second_octets <<<"$second_address"
+	mask=$(((0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF))
+	local first_ip=$(((10#${first_octets[0]} << 24) | (10#${first_octets[1]} << 16) | (10#${first_octets[2]} << 8) | 10#${first_octets[3]}))
+	local second_ip=$(((10#${second_octets[0]} << 24) | (10#${second_octets[1]} << 16) | (10#${second_octets[2]} << 8) | 10#${second_octets[3]}))
+	(((first_ip & mask) == (second_ip & mask)))
+}
+
+ipv6_cidrs_overlap() {
+	local first="$1" second="$2" first_prefix second_prefix prefix index remaining mask
+	local -a first_hextets second_hextets
+	first_prefix=$((10#${first##*/}))
+	second_prefix=$((10#${second##*/}))
+	prefix=$first_prefix
+	((second_prefix < prefix)) && prefix=$second_prefix
+	expand_ipv6_address "${first%/*}" first_hextets || return 1
+	expand_ipv6_address "${second%/*}" second_hextets || return 1
+
+	remaining=$prefix
+	for index in "${!first_hextets[@]}"; do
+		((remaining <= 0)) && return 0
+		if ((remaining >= 16)); then
+			((first_hextets[index] == second_hextets[index])) || return 1
+			remaining=$((remaining - 16))
+		else
+			mask=$(((0xFFFF << (16 - remaining)) & 0xFFFF))
+			(((first_hextets[index] & mask) == (second_hextets[index] & mask)))
+			return
+		fi
+	done
+	return 0
+}
+
 validate_positive_int() {
 	local value="$1"
 	local name="$2"
@@ -643,9 +931,12 @@ validate_configuration() {
 	*) log_fatal "Invalid protocol: $PROTOCOL. Must be 'udp' or 'tcp'." ;;
 	esac
 
-	# Validate DNS
+	# Validate DNS. Split-tunnel installs do not push a DNS server.
 	case "$DNS" in
 	system | unbound | cloudflare | quad9 | quad9-uncensored | fdn | dnswatch | opendns | google | yandex | adguard | nextdns | custom) ;;
+	"")
+		[[ $ROUTE_INTERNET == "n" ]] || log_fatal "A DNS provider is required when internet routing is enabled."
+		;;
 	*) log_fatal "Invalid DNS provider: $DNS. Valid providers: system, unbound, cloudflare, quad9, quad9-uncensored, fdn, dnswatch, opendns, google, yandex, adguard, nextdns, custom" ;;
 	esac
 
@@ -685,6 +976,31 @@ validate_configuration() {
 	if [[ $CLIENT_IPV4 != "y" ]] && [[ $CLIENT_IPV6 != "y" ]]; then
 		log_fatal "At least one of CLIENT_IPV4 or CLIENT_IPV6 must be 'y'"
 	fi
+
+	case "$ROUTE_INTERNET" in
+	y | n) ;;
+	*) log_fatal "Invalid ROUTE_INTERNET value: $ROUTE_INTERNET. Must be 'y' or 'n'." ;;
+	esac
+	case "$CLIENT_TO_CLIENT" in
+	y | n) ;;
+	*) log_fatal "Invalid CLIENT_TO_CLIENT value: $CLIENT_TO_CLIENT. Must be 'y' or 'n'." ;;
+	esac
+
+	normalize_local_networks
+	if has_local_network_family 4 && [[ $CLIENT_IPV4 != "y" ]]; then
+		log_fatal "IPv4 local networks require IPv4 for VPN clients. Use --client-ipv4 or remove the IPv4 local network."
+	fi
+	if has_local_network_family 6 && [[ $CLIENT_IPV6 != "y" ]]; then
+		log_fatal "IPv6 local networks require IPv6 for VPN clients. Use --client-ipv6 or remove the IPv6 local network."
+	fi
+	local local_network
+	while IFS= read -r local_network; do
+		if [[ $local_network == *.* ]] && ipv4_cidrs_overlap "$local_network" "$VPN_SUBNET_IPV4/24"; then
+			log_fatal "Local network $local_network overlaps the IPv4 VPN subnet $VPN_SUBNET_IPV4/24."
+		elif [[ $local_network == *:* ]] && ipv6_cidrs_overlap "$local_network" "${VPN_SUBNET_IPV6}/112"; then
+			log_fatal "Local network $local_network overlaps the IPv6 VPN subnet ${VPN_SUBNET_IPV6}/112."
+		fi
+	done < <(tr ',' '\n' <<<"$LOCAL_NETWORKS")
 
 	# Validate ENDPOINT_TYPE
 	case "$ENDPOINT_TYPE" in
@@ -950,6 +1266,27 @@ cmd_install() {
 			VPN_SUBNET_IPV4="$2"
 			shift 2
 			;;
+		--route-internet)
+			ROUTE_INTERNET=y
+			shift
+			;;
+		--no-route-internet)
+			ROUTE_INTERNET=n
+			shift
+			;;
+		--client-to-client)
+			CLIENT_TO_CLIENT=y
+			shift
+			;;
+		--no-client-to-client)
+			CLIENT_TO_CLIENT=n
+			shift
+			;;
+		--local-network)
+			[[ -z "${2:-}" ]] && log_fatal "--local-network requires an argument"
+			add_local_network "$2"
+			shift 2
+			;;
 		--port)
 			[[ -z "${2:-}" ]] && log_fatal "--port requires an argument"
 			validate_port "$2"
@@ -1157,12 +1494,17 @@ cmd_install() {
 		# Set all defaults for any unset values
 		set_installation_defaults
 
-		# Validate configuration values (catches invalid env vars)
-		validate_configuration
-
 		# Detect IPs and set up network config (interactive mode does this in installQuestions)
 		detect_server_ips
 	fi
+
+	# Split-tunnel installs leave the client's DNS configuration unchanged.
+	if [[ $ROUTE_INTERNET == "n" ]]; then
+		DNS=""
+	fi
+
+	# Validate both CLI and interactive configuration.
+	validate_configuration
 
 	# Prepare derived network configuration (gateways, etc.)
 	prepare_network_config
@@ -1512,8 +1854,7 @@ cmd_interactive() {
 	if isOpenVPNInstalled; then
 		manageMenu
 	else
-		installQuestions
-		installOpenVPN
+		cmd_install --interactive
 	fi
 }
 
@@ -2307,6 +2648,45 @@ function installQuestions() {
 		esac
 	fi
 
+	# ==========================================================================
+	# Step 7: Client access policy
+	# ==========================================================================
+	log_menu ""
+	log_prompt "What should VPN clients be allowed to access?"
+	prompt_yes_no "Route client internet traffic through the VPN?" "y" ROUTE_INTERNET
+	prompt_yes_no "Allow VPN clients to access each other?" "n" CLIENT_TO_CLIENT
+
+	local local_network_access
+	prompt_yes_no "Allow VPN clients to access the server's local network? (mainly for home servers)" "n" local_network_access
+	if [[ $local_network_access == "y" ]]; then
+		local detected_local_networks
+		detected_local_networks=$(detect_private_local_networks "$CLIENT_IPV4" "$CLIENT_IPV6")
+		log_prompt "Enter the server-side networks clients may access."
+		log_prompt "Use comma-separated CIDRs, for example: 192.168.1.0/24,fd00:1::/64"
+		if [[ -n $detected_local_networks ]]; then
+			log_prompt "Detected local networks: $detected_local_networks"
+			log_prompt "Review the list and remove any network that VPN clients should not access."
+		fi
+		until [[ -n $LOCAL_NETWORKS ]]; do
+			local configured_networks network networks_valid=true
+			read -rp "Local networks: " -e -i "$detected_local_networks" configured_networks
+			while IFS= read -r network; do
+				network="${network//[[:space:]]/}"
+				if [[ -z $network ]] || ! is_valid_local_network "$network"; then
+					log_warn "Invalid network CIDR: ${network:-<empty>}"
+					networks_valid=false
+					break
+				fi
+			done < <(tr ',' '\n' <<<"$configured_networks")
+			if [[ $networks_valid == true ]]; then
+				LOCAL_NETWORKS="$configured_networks"
+				normalize_local_networks
+			fi
+		done
+	else
+		LOCAL_NETWORKS=""
+	fi
+
 	log_menu ""
 	log_prompt "What port do you want OpenVPN to listen to?"
 	log_menu "   1) Default: 1194"
@@ -2346,44 +2726,49 @@ function installQuestions() {
 		PROTOCOL="tcp"
 		;;
 	esac
-	log_menu ""
-	log_prompt "What DNS resolvers do you want to use with the VPN?"
-	local dns_labels=("Current system resolvers (from /etc/resolv.conf)" "Self-hosted DNS Resolver (Unbound)" "Cloudflare (Anycast: worldwide)" "Quad9 (Anycast: worldwide)" "Quad9 uncensored (Anycast: worldwide)" "FDN (France)" "DNS.WATCH (Germany)" "OpenDNS (Anycast: worldwide)" "Google (Anycast: worldwide)" "Yandex Basic (Russia)" "AdGuard DNS (Anycast: worldwide)" "NextDNS (Anycast: worldwide)" "Custom")
-	local dns_valid=false
-	until [[ $dns_valid == true ]]; do
-		select_with_labels "DNS" dns_labels DNS_PROVIDERS "cloudflare" DNS
-		if [[ $DNS == "unbound" ]] && [[ -e /etc/unbound/unbound.conf ]]; then
-			log_menu ""
-			log_prompt "Unbound is already installed."
-			log_prompt "You can allow the script to configure it in order to use it from your OpenVPN clients"
-			log_prompt "We will simply add a second server to /etc/unbound/unbound.conf for the OpenVPN subnet."
-			log_prompt "No changes are made to the current configuration."
-			log_menu ""
+	if [[ $ROUTE_INTERNET == "y" ]]; then
+		log_menu ""
+		log_prompt "What DNS resolvers do you want to use with the VPN?"
+		local dns_labels=("Current system resolvers (from /etc/resolv.conf)" "Self-hosted DNS Resolver (Unbound)" "Cloudflare (Anycast: worldwide)" "Quad9 (Anycast: worldwide)" "Quad9 uncensored (Anycast: worldwide)" "FDN (France)" "DNS.WATCH (Germany)" "OpenDNS (Anycast: worldwide)" "Google (Anycast: worldwide)" "Yandex Basic (Russia)" "AdGuard DNS (Anycast: worldwide)" "NextDNS (Anycast: worldwide)" "Custom")
+		local dns_valid=false
+		until [[ $dns_valid == true ]]; do
+			select_with_labels "DNS" dns_labels DNS_PROVIDERS "cloudflare" DNS
+			if [[ $DNS == "unbound" ]] && [[ -e /etc/unbound/unbound.conf ]]; then
+				log_menu ""
+				log_prompt "Unbound is already installed."
+				log_prompt "You can allow the script to configure it in order to use it from your OpenVPN clients"
+				log_prompt "We will simply add a second server to /etc/unbound/unbound.conf for the OpenVPN subnet."
+				log_prompt "No changes are made to the current configuration."
+				log_menu ""
 
-			local unbound_continue
-			until [[ $unbound_continue =~ ^[yn]$ ]]; do
-				read -rp "Apply configuration changes to Unbound? [y/n]: " -e unbound_continue
-			done
-			if [[ $unbound_continue == "n" ]]; then
-				unset DNS
+				local unbound_continue
+				until [[ $unbound_continue =~ ^[yn]$ ]]; do
+					read -rp "Apply configuration changes to Unbound? [y/n]: " -e unbound_continue
+				done
+				if [[ $unbound_continue == "n" ]]; then
+					unset DNS
+				else
+					dns_valid=true
+				fi
+			elif [[ $DNS == "custom" ]]; then
+				until [[ $DNS1 =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
+					read -rp "Primary DNS: " -e DNS1
+				done
+				until [[ $DNS2 =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
+					read -rp "Secondary DNS (optional): " -e DNS2
+					if [[ $DNS2 == "" ]]; then
+						break
+					fi
+				done
+				dns_valid=true
 			else
 				dns_valid=true
 			fi
-		elif [[ $DNS == "custom" ]]; then
-			until [[ $DNS1 =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
-				read -rp "Primary DNS: " -e DNS1
-			done
-			until [[ $DNS2 =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
-				read -rp "Secondary DNS (optional): " -e DNS2
-				if [[ $DNS2 == "" ]]; then
-					break
-				fi
-			done
-			dns_valid=true
-		else
-			dns_valid=true
-		fi
-	done
+		done
+	else
+		DNS=""
+		log_info "VPN DNS is not configured because internet routing is disabled."
+	fi
 	log_menu ""
 	log_prompt "Do you want to allow a single .ovpn profile to be used on multiple devices simultaneously?"
 	log_prompt "Note: Enabling this disables persistent IP addresses for clients."
@@ -2629,6 +3014,9 @@ function installOpenVPN() {
 		log_info "  CLIENT_IPV6=$CLIENT_IPV6"
 		log_info "  VPN_SUBNET_IPV4=$VPN_SUBNET_IPV4"
 		log_info "  VPN_SUBNET_IPV6=$VPN_SUBNET_IPV6"
+		log_info "  ROUTE_INTERNET=$ROUTE_INTERNET"
+		log_info "  CLIENT_TO_CLIENT=$CLIENT_TO_CLIENT"
+		log_info "  LOCAL_NETWORKS=${LOCAL_NETWORKS:-none}"
 		log_info "  PORT=$PORT"
 		log_info "  PROTOCOL=$PROTOCOL"
 		log_info "  DNS=$DNS"
@@ -2862,6 +3250,9 @@ function installOpenVPN() {
 	if [[ $MULTI_CLIENT == "y" ]]; then
 		echo "duplicate-cn" >>/etc/openvpn/server/server.conf
 	fi
+	if [[ $CLIENT_TO_CLIENT == "y" ]]; then
+		echo "client-to-client" >>/etc/openvpn/server/server.conf
+	fi
 
 	echo "dev tun" >>/etc/openvpn/server/server.conf
 	# Only add user/group if systemd doesn't handle it (avoids double privilege drop)
@@ -2892,152 +3283,168 @@ topology subnet" >>/etc/openvpn/server/server.conf
 		echo "ifconfig-pool-persist ipp.txt" >>/etc/openvpn/server/server.conf
 	fi
 
-	# DNS resolvers
-	case $DNS in
-	system)
-		# Locate the proper resolv.conf
-		# Needed for systems running systemd-resolved
-		if grep -q "127.0.0.53" "/etc/resolv.conf"; then
-			RESOLVCONF='/run/systemd/resolve/resolv.conf'
-		else
-			RESOLVCONF='/etc/resolv.conf'
-		fi
-		# Obtain the resolvers from resolv.conf and use them for OpenVPN
-		sed -ne 's/^nameserver[[:space:]]\+\([^[:space:]]\+\).*$/\1/p' $RESOLVCONF | while read -r line; do
-			# Copy IPv4 resolvers if client has IPv4, or IPv6 resolvers if client has IPv6
-			if [[ $line =~ ^[0-9.]*$ ]] && [[ $CLIENT_IPV4 == 'y' ]]; then
-				echo "push \"dhcp-option DNS $line\"" >>/etc/openvpn/server/server.conf
-			elif [[ $line =~ : ]] && [[ $CLIENT_IPV6 == 'y' ]]; then
-				echo "push \"dhcp-option DNS $line\"" >>/etc/openvpn/server/server.conf
+	# DNS resolvers are only pushed when the VPN carries internet traffic.
+	if [[ $ROUTE_INTERNET == "y" ]]; then
+		case $DNS in
+		system)
+			# Locate the proper resolv.conf
+			# Needed for systems running systemd-resolved
+			if grep -q "127.0.0.53" "/etc/resolv.conf"; then
+				RESOLVCONF='/run/systemd/resolve/resolv.conf'
+			else
+				RESOLVCONF='/etc/resolv.conf'
 			fi
-		done
-		;;
-	unbound)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo "push \"dhcp-option DNS $VPN_GATEWAY_IPV4\"" >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo "push \"dhcp-option DNS $VPN_GATEWAY_IPV6\"" >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	cloudflare)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 1.0.0.1"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 1.1.1.1"' >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 2606:4700:4700::1001"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2606:4700:4700::1111"' >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	quad9)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 9.9.9.9"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 149.112.112.112"' >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 2620:fe::fe"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2620:fe::9"' >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	quad9-uncensored)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 9.9.9.10"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 149.112.112.10"' >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 2620:fe::10"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2620:fe::fe:10"' >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	fdn)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 80.67.169.40"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 80.67.169.12"' >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 2001:910:800::40"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2001:910:800::12"' >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	dnswatch)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 84.200.69.80"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 84.200.70.40"' >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 2001:1608:10:25::1c04:b12f"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2001:1608:10:25::9249:d69b"' >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	opendns)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 208.67.222.222"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 208.67.220.220"' >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 2620:119:35::35"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2620:119:53::53"' >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	google)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 8.8.8.8"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 8.8.4.4"' >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 2001:4860:4860::8888"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2001:4860:4860::8844"' >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	yandex)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 77.88.8.8"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 77.88.8.1"' >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 2a02:6b8::feed:0ff"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2a02:6b8:0:1::feed:0ff"' >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	adguard)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 94.140.14.14"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 94.140.15.15"' >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 2a10:50c0::ad1:ff"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2a10:50c0::ad2:ff"' >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	nextdns)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 45.90.28.167"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 45.90.30.167"' >>/etc/openvpn/server/server.conf
-		fi
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo 'push "dhcp-option DNS 2a07:a8c0::"' >>/etc/openvpn/server/server.conf
-			echo 'push "dhcp-option DNS 2a07:a8c1::"' >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	custom)
-		echo "push \"dhcp-option DNS $DNS1\"" >>/etc/openvpn/server/server.conf
-		if [[ $DNS2 != "" ]]; then
-			echo "push \"dhcp-option DNS $DNS2\"" >>/etc/openvpn/server/server.conf
-		fi
-		;;
-	esac
+			# Obtain the resolvers from resolv.conf and use them for OpenVPN
+			sed -ne 's/^nameserver[[:space:]]\+\([^[:space:]]\+\).*$/\1/p' $RESOLVCONF | while read -r line; do
+				# Copy IPv4 resolvers if client has IPv4, or IPv6 resolvers if client has IPv6
+				if [[ $line =~ ^[0-9.]*$ ]] && [[ $CLIENT_IPV4 == 'y' ]]; then
+					echo "push \"dhcp-option DNS $line\"" >>/etc/openvpn/server/server.conf
+				elif [[ $line =~ : ]] && [[ $CLIENT_IPV6 == 'y' ]]; then
+					echo "push \"dhcp-option DNS $line\"" >>/etc/openvpn/server/server.conf
+				fi
+			done
+			;;
+		unbound)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo "push \"dhcp-option DNS $VPN_GATEWAY_IPV4\"" >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo "push \"dhcp-option DNS $VPN_GATEWAY_IPV6\"" >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		cloudflare)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 1.0.0.1"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 1.1.1.1"' >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 2606:4700:4700::1001"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 2606:4700:4700::1111"' >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		quad9)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 9.9.9.9"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 149.112.112.112"' >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 2620:fe::fe"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 2620:fe::9"' >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		quad9-uncensored)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 9.9.9.10"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 149.112.112.10"' >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 2620:fe::10"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 2620:fe::fe:10"' >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		fdn)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 80.67.169.40"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 80.67.169.12"' >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 2001:910:800::40"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 2001:910:800::12"' >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		dnswatch)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 84.200.69.80"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 84.200.70.40"' >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 2001:1608:10:25::1c04:b12f"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 2001:1608:10:25::9249:d69b"' >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		opendns)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 208.67.222.222"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 208.67.220.220"' >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 2620:119:35::35"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 2620:119:53::53"' >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		google)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 8.8.8.8"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 8.8.4.4"' >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 2001:4860:4860::8888"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 2001:4860:4860::8844"' >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		yandex)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 77.88.8.8"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 77.88.8.1"' >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 2a02:6b8::feed:0ff"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 2a02:6b8:0:1::feed:0ff"' >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		adguard)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 94.140.14.14"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 94.140.15.15"' >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 2a10:50c0::ad1:ff"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 2a10:50c0::ad2:ff"' >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		nextdns)
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 45.90.28.167"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 45.90.30.167"' >>/etc/openvpn/server/server.conf
+			fi
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo 'push "dhcp-option DNS 2a07:a8c0::"' >>/etc/openvpn/server/server.conf
+				echo 'push "dhcp-option DNS 2a07:a8c1::"' >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		custom)
+			echo "push \"dhcp-option DNS $DNS1\"" >>/etc/openvpn/server/server.conf
+			if [[ $DNS2 != "" ]]; then
+				echo "push \"dhcp-option DNS $DNS2\"" >>/etc/openvpn/server/server.conf
+			fi
+			;;
+		esac
+	fi
 
-	# Redirect gateway settings - always redirect both IPv4 and IPv6 to prevent leaks
-	# For IPv4: redirect-gateway def1 routes all IPv4 through VPN (or drops it if IPv4 not configured)
-	# For IPv6: route-ipv6 + redirect-gateway ipv6 routes all IPv6, or block-ipv6 drops it
-	echo 'push "redirect-gateway def1 bypass-dhcp"' >>/etc/openvpn/server/server.conf
-	if [[ $CLIENT_IPV6 == "y" ]]; then
-		echo 'push "route-ipv6 2000::/3"' >>/etc/openvpn/server/server.conf
-		echo 'push "redirect-gateway ipv6"' >>/etc/openvpn/server/server.conf
-	else
-		# Block IPv6 on clients to prevent IPv6 leaks when VPN only handles IPv4
-		echo 'push "block-ipv6"' >>/etc/openvpn/server/server.conf
+	# Push explicit routes for server-side networks. These routes are independent
+	# from internet routing and are protected by matching firewall rules.
+	local local_network address prefix netmask
+	while IFS= read -r local_network; do
+		address="${local_network%/*}"
+		prefix="${local_network##*/}"
+		netmask=$(ipv4_prefix_to_netmask "$prefix")
+		echo "push \"route $address $netmask\"" >>/etc/openvpn/server/server.conf
+	done < <(local_networks_for_family 4)
+	while IFS= read -r local_network; do
+		echo "push \"route-ipv6 $local_network\"" >>/etc/openvpn/server/server.conf
+	done < <(local_networks_for_family 6)
+
+	# Full-tunnel mode redirects enabled address families and blocks leaks from
+	# disabled families. Split-tunnel mode leaves normal client internet routes intact.
+	if [[ $ROUTE_INTERNET == "y" ]]; then
+		echo 'push "redirect-gateway def1 bypass-dhcp"' >>/etc/openvpn/server/server.conf
+		if [[ $CLIENT_IPV6 == "y" ]]; then
+			echo 'push "route-ipv6 2000::/3"' >>/etc/openvpn/server/server.conf
+			echo 'push "redirect-gateway ipv6"' >>/etc/openvpn/server/server.conf
+		else
+			# Block IPv6 on clients to prevent IPv6 leaks when VPN only handles IPv4.
+			echo 'push "block-ipv6"' >>/etc/openvpn/server/server.conf
+		fi
 	fi
 
 	if [[ -n $MTU ]]; then
@@ -3084,6 +3491,24 @@ management /var/run/openvpn-server/server.sock unix
 verb 3"
 	} >>/etc/openvpn/server/server.conf
 
+	# Record installer-owned policy so firewall rules can be removed exactly.
+	if systemctl is-active --quiet firewalld; then
+		FIREWALL_BACKEND=firewalld
+	elif systemctl is-active --quiet nftables; then
+		FIREWALL_BACKEND=nftables
+	else
+		FIREWALL_BACKEND=iptables
+	fi
+	{
+		echo "FIREWALL_BACKEND=$FIREWALL_BACKEND"
+		echo "ROUTE_INTERNET=$ROUTE_INTERNET"
+		echo "CLIENT_TO_CLIENT=$CLIENT_TO_CLIENT"
+		echo "LOCAL_NETWORKS=$LOCAL_NETWORKS"
+		echo "CLIENT_IPV4=$CLIENT_IPV4"
+		echo "CLIENT_IPV6=$CLIENT_IPV6"
+	} >/etc/openvpn/server/openvpn-install.conf
+	chmod 600 /etc/openvpn/server/openvpn-install.conf
+
 	# Create client-config-dir dir
 	run_cmd_fatal "Creating client config directory" mkdir -p /etc/openvpn/server/ccd
 	# Create log dir
@@ -3096,19 +3521,22 @@ verb 3"
 		chown -R "$OPENVPN_USER:$OPENVPN_GROUP" /etc/openvpn/server
 		chown "$OPENVPN_USER:$OPENVPN_GROUP" /var/log/openvpn
 	fi
+	chown root:root /etc/openvpn/server/openvpn-install.conf
+	chmod 600 /etc/openvpn/server/openvpn-install.conf
 
 	# Enable routing
 	log_info "Enabling IP forwarding..."
 	run_cmd_fatal "Creating sysctl.d directory" mkdir -p /etc/sysctl.d
 
-	# Enable IPv4 forwarding if clients get IPv4
-	if [[ $CLIENT_IPV4 == 'y' ]]; then
+	# Forwarding is needed for internet or server-side network access. OpenVPN
+	# handles non-DCO client-to-client traffic internally, while DCO traffic is
+	# still constrained by the firewall rules below.
+	if [[ $CLIENT_IPV4 == 'y' ]] && { [[ $ROUTE_INTERNET == 'y' ]] || has_local_network_family 4 || [[ $CLIENT_TO_CLIENT == 'y' ]]; }; then
 		echo 'net.ipv4.ip_forward=1' >/etc/sysctl.d/99-openvpn.conf
 	else
-		echo '# IPv4 forwarding not needed (no IPv4 clients)' >/etc/sysctl.d/99-openvpn.conf
+		echo '# IPv4 forwarding not required by the selected access policy' >/etc/sysctl.d/99-openvpn.conf
 	fi
-	# Enable IPv6 forwarding if clients get IPv6
-	if [[ $CLIENT_IPV6 == 'y' ]]; then
+	if [[ $CLIENT_IPV6 == 'y' ]] && { [[ $ROUTE_INTERNET == 'y' ]] || has_local_network_family 6 || [[ $CLIENT_TO_CLIENT == 'y' ]]; }; then
 		echo 'net.ipv6.conf.all.forwarding=1' >>/etc/sysctl.d/99-openvpn.conf
 	fi
 	# Apply sysctl rules
@@ -3186,7 +3614,7 @@ verb 3"
 		run_cmd "Starting OpenVPN service" systemctl restart openvpn-server@server
 	fi
 
-	if [[ $DNS == "unbound" ]]; then
+	if [[ $ROUTE_INTERNET == "y" && $DNS == "unbound" ]]; then
 		installUnbound
 	fi
 
@@ -3194,34 +3622,66 @@ verb 3"
 	# Use source-based rules for VPN traffic (works reliably regardless of which tun interface OpenVPN uses)
 	log_info "Configuring firewall rules..."
 
-	if systemctl is-active --quiet firewalld; then
-		# Use firewalld native commands for systems with firewalld active
+	if [[ $FIREWALL_BACKEND == 'firewalld' ]]; then
+		# A dedicated source zone identifies VPN traffic. A policy object applies
+		# destination rules to forwarded traffic; zone rich rules alone only
+		# govern traffic addressed to the server.
 		log_info "firewalld detected, using firewall-cmd..."
-		run_cmd "Adding OpenVPN port to firewalld" firewall-cmd --permanent --add-port="$PORT/$PROTOCOL"
-		run_cmd "Adding masquerade to firewalld" firewall-cmd --permanent --add-masquerade
+		run_cmd_fatal "Adding OpenVPN port to firewalld" firewall-cmd --permanent --add-port="$PORT/$PROTOCOL"
+		run_cmd_fatal "Creating OpenVPN firewalld zone" firewall-cmd --permanent --new-zone=openvpn-install
+		run_cmd_fatal "Creating OpenVPN firewalld policy" firewall-cmd --permanent --new-policy=openvpn-egress
+		run_cmd_fatal "Setting OpenVPN policy ingress" firewall-cmd --permanent --policy=openvpn-egress --add-ingress-zone=openvpn-install
+		run_cmd_fatal "Setting OpenVPN policy egress" firewall-cmd --permanent --policy=openvpn-egress --add-egress-zone=ANY
+		run_cmd_fatal "Setting OpenVPN policy default" firewall-cmd --permanent --policy=openvpn-egress --set-target=DROP
 
-		# Add rich rules for VPN traffic (source-based only, as firewalld doesn't reliably
-		# support interface patterns with direct rules when using nftables backend)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			run_cmd "Adding IPv4 VPN subnet rule" firewall-cmd --permanent --add-rich-rule="rule family=\"ipv4\" source address=\"$VPN_SUBNET_IPV4/24\" accept"
+		if [[ -n $VPN_SUBNET_IPV4 ]]; then
+			run_cmd_fatal "Adding IPv4 VPN source to firewalld" firewall-cmd --permanent --zone=openvpn-install --add-source="$VPN_SUBNET_IPV4/24"
+			run_cmd_fatal "Allowing the IPv4 VPN gateway" firewall-cmd --permanent --zone=openvpn-install --add-rich-rule="rule priority=\"-400\" family=\"ipv4\" destination address=\"$VPN_GATEWAY_IPV4/32\" accept"
+			if [[ $CLIENT_IPV4 == 'y' ]]; then
+				while IFS= read -r local_network; do
+					run_cmd_fatal "Allowing local IPv4 network $local_network" firewall-cmd --permanent --policy=openvpn-egress --add-rich-rule="rule priority=\"-300\" family=\"ipv4\" destination address=\"$local_network\" accept"
+					run_cmd_fatal "Adding NAT for local IPv4 network $local_network" firewall-cmd --permanent --policy=openvpn-egress --add-rich-rule="rule family=\"ipv4\" destination address=\"$local_network\" masquerade"
+				done < <(local_networks_for_family 4)
+				if [[ $ROUTE_INTERNET == 'y' ]]; then
+					for protected_network in "${PROTECTED_IPV4_NETWORKS[@]}"; do
+						run_cmd_fatal "Protecting IPv4 network $protected_network" firewall-cmd --permanent --policy=openvpn-egress --add-rich-rule="rule priority=\"-200\" family=\"ipv4\" destination address=\"$protected_network\" reject"
+					done
+					run_cmd_fatal "Allowing IPv4 internet access" firewall-cmd --permanent --policy=openvpn-egress --add-rich-rule="rule priority=\"-100\" family=\"ipv4\" accept"
+					run_cmd_fatal "Adding IPv4 internet NAT" firewall-cmd --permanent --policy=openvpn-egress --add-rich-rule="rule family=\"ipv4\" masquerade"
+				fi
+			fi
 		fi
 
 		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			run_cmd "Adding IPv6 VPN subnet rule" firewall-cmd --permanent --add-rich-rule="rule family=\"ipv6\" source address=\"${VPN_SUBNET_IPV6}/112\" accept"
+			run_cmd_fatal "Adding IPv6 VPN source to firewalld" firewall-cmd --permanent --zone=openvpn-install --add-source="${VPN_SUBNET_IPV6}/112"
+			run_cmd_fatal "Allowing the IPv6 VPN gateway" firewall-cmd --permanent --zone=openvpn-install --add-rich-rule="rule priority=\"-400\" family=\"ipv6\" destination address=\"$VPN_GATEWAY_IPV6/128\" accept"
+			while IFS= read -r local_network; do
+				run_cmd_fatal "Allowing local IPv6 network $local_network" firewall-cmd --permanent --policy=openvpn-egress --add-rich-rule="rule priority=\"-300\" family=\"ipv6\" destination address=\"$local_network\" accept"
+				run_cmd_fatal "Adding NAT for local IPv6 network $local_network" firewall-cmd --permanent --policy=openvpn-egress --add-rich-rule="rule family=\"ipv6\" destination address=\"$local_network\" masquerade"
+			done < <(local_networks_for_family 6)
+			if [[ $ROUTE_INTERNET == 'y' ]]; then
+				for protected_network in "${PROTECTED_IPV6_NETWORKS[@]}"; do
+					run_cmd_fatal "Protecting IPv6 network $protected_network" firewall-cmd --permanent --policy=openvpn-egress --add-rich-rule="rule priority=\"-200\" family=\"ipv6\" destination address=\"$protected_network\" reject"
+				done
+				run_cmd_fatal "Allowing IPv6 internet access" firewall-cmd --permanent --policy=openvpn-egress --add-rich-rule="rule priority=\"-100\" family=\"ipv6\" accept"
+				run_cmd_fatal "Adding IPv6 internet NAT" firewall-cmd --permanent --policy=openvpn-egress --add-rich-rule="rule family=\"ipv6\" masquerade"
+			fi
 		fi
 
-		run_cmd "Reloading firewalld" firewall-cmd --reload
-	elif systemctl is-active --quiet nftables; then
-		# Use nftables native rules for systems with nftables active
+		if [[ $CLIENT_TO_CLIENT == 'y' ]]; then
+			run_cmd_fatal "Allowing firewalld intra-zone forwarding" firewall-cmd --permanent --zone=openvpn-install --add-forward
+		fi
+
+		run_cmd_fatal "Reloading firewalld" firewall-cmd --reload
+	elif [[ $FIREWALL_BACKEND == 'nftables' ]]; then
 		log_info "nftables detected, configuring nftables rules..."
 		run_cmd_fatal "Creating nftables directory" mkdir -p /etc/nftables
 
-		# Create nftables rules file
 		{
 			echo "table inet openvpn {"
 			echo "	chain input {"
 			echo "		type filter hook input priority 0; policy accept;"
-			if [[ $CLIENT_IPV4 == 'y' ]]; then
+			if [[ -n $VPN_SUBNET_IPV4 ]]; then
 				echo "		iifname \"tun*\" ip saddr $VPN_SUBNET_IPV4/24 accept"
 			fi
 			if [[ $CLIENT_IPV6 == 'y' ]]; then
@@ -3231,93 +3691,203 @@ verb 3"
 			echo "	}"
 			echo ""
 			echo "	chain forward {"
-			echo "		type filter hook forward priority 0; policy accept;"
-			if [[ $CLIENT_IPV4 == 'y' ]]; then
-				echo "		iifname \"tun*\" ip saddr $VPN_SUBNET_IPV4/24 accept"
-				echo "		oifname \"tun*\" ip daddr $VPN_SUBNET_IPV4/24 accept"
+			echo "		type filter hook forward priority -10; policy accept;"
+			if [[ -n $VPN_SUBNET_IPV4 ]]; then
+				echo "		oifname \"tun*\" ip daddr $VPN_SUBNET_IPV4/24 ct state established,related accept"
+				if [[ $CLIENT_IPV4 == 'y' ]]; then
+					while IFS= read -r local_network; do
+						echo "		iifname \"tun*\" ip saddr $VPN_SUBNET_IPV4/24 ip daddr $local_network accept"
+					done < <(local_networks_for_family 4)
+				fi
+				if [[ $CLIENT_IPV4 == 'y' && $CLIENT_TO_CLIENT == 'y' ]]; then
+					echo "		iifname \"tun*\" ip saddr $VPN_SUBNET_IPV4/24 ip daddr $VPN_SUBNET_IPV4/24 accept"
+				fi
+				if [[ $CLIENT_IPV4 == 'y' && $ROUTE_INTERNET == 'y' ]]; then
+					for protected_network in "${PROTECTED_IPV4_NETWORKS[@]}"; do
+						echo "		iifname \"tun*\" ip saddr $VPN_SUBNET_IPV4/24 ip daddr $protected_network drop"
+					done
+					echo "		iifname \"tun*\" ip saddr $VPN_SUBNET_IPV4/24 accept"
+				else
+					echo "		iifname \"tun*\" ip saddr $VPN_SUBNET_IPV4/24 drop"
+				fi
 			fi
 			if [[ $CLIENT_IPV6 == 'y' ]]; then
-				echo "		iifname \"tun*\" ip6 saddr ${VPN_SUBNET_IPV6}/112 accept"
-				echo "		oifname \"tun*\" ip6 daddr ${VPN_SUBNET_IPV6}/112 accept"
+				echo "		oifname \"tun*\" ip6 daddr ${VPN_SUBNET_IPV6}/112 ct state established,related accept"
+				while IFS= read -r local_network; do
+					echo "		iifname \"tun*\" ip6 saddr ${VPN_SUBNET_IPV6}/112 ip6 daddr $local_network accept"
+				done < <(local_networks_for_family 6)
+				if [[ $CLIENT_TO_CLIENT == 'y' ]]; then
+					echo "		iifname \"tun*\" ip6 saddr ${VPN_SUBNET_IPV6}/112 ip6 daddr ${VPN_SUBNET_IPV6}/112 accept"
+				fi
+				if [[ $ROUTE_INTERNET == 'y' ]]; then
+					for protected_network in "${PROTECTED_IPV6_NETWORKS[@]}"; do
+						echo "		iifname \"tun*\" ip6 saddr ${VPN_SUBNET_IPV6}/112 ip6 daddr $protected_network drop"
+					done
+					echo "		iifname \"tun*\" ip6 saddr ${VPN_SUBNET_IPV6}/112 accept"
+				else
+					echo "		iifname \"tun*\" ip6 saddr ${VPN_SUBNET_IPV6}/112 drop"
+				fi
 			fi
 			echo "	}"
 			echo "}"
 		} >/etc/nftables/openvpn.nft
 
-		# IPv4 NAT rules (only if clients get IPv4)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo "
-table ip openvpn-nat {
-	chain postrouting {
-		type nat hook postrouting priority 100; policy accept;
-		ip saddr $VPN_SUBNET_IPV4/24 oifname \"$NIC\" masquerade
-	}
-}" >>/etc/nftables/openvpn.nft
+		if [[ $CLIENT_IPV4 == 'y' ]] && { [[ $ROUTE_INTERNET == 'y' ]] || has_local_network_family 4; }; then
+			{
+				echo ""
+				echo "table ip openvpn-nat {"
+				echo "	chain postrouting {"
+				echo "		type nat hook postrouting priority 100; policy accept;"
+				while IFS= read -r local_network; do
+					echo "		ip saddr $VPN_SUBNET_IPV4/24 ip daddr $local_network masquerade"
+				done < <(local_networks_for_family 4)
+				if [[ $ROUTE_INTERNET == 'y' ]]; then
+					echo "		ip saddr $VPN_SUBNET_IPV4/24 oifname \"$NIC\" masquerade"
+				fi
+				echo "	}"
+				echo "}"
+			} >>/etc/nftables/openvpn.nft
 		fi
 
-		# IPv6 NAT rules (only if clients get IPv6)
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo "
-table ip6 openvpn-nat {
-	chain postrouting {
-		type nat hook postrouting priority 100; policy accept;
-		ip6 saddr ${VPN_SUBNET_IPV6}/112 oifname \"$NIC\" masquerade
-	}
-}" >>/etc/nftables/openvpn.nft
+		if [[ $CLIENT_IPV6 == 'y' ]] && { [[ $ROUTE_INTERNET == 'y' ]] || has_local_network_family 6; }; then
+			{
+				echo ""
+				echo "table ip6 openvpn-nat {"
+				echo "	chain postrouting {"
+				echo "		type nat hook postrouting priority 100; policy accept;"
+				while IFS= read -r local_network; do
+					echo "		ip6 saddr ${VPN_SUBNET_IPV6}/112 ip6 daddr $local_network masquerade"
+				done < <(local_networks_for_family 6)
+				if [[ $ROUTE_INTERNET == 'y' ]]; then
+					echo "		ip6 saddr ${VPN_SUBNET_IPV6}/112 oifname \"$NIC\" masquerade"
+				fi
+				echo "	}"
+				echo "}"
+			} >>/etc/nftables/openvpn.nft
 		fi
 
-		# Add include to nftables.conf if not already present
 		if ! grep -q 'include.*/etc/nftables/openvpn.nft' /etc/nftables.conf; then
-			run_cmd "Adding include to nftables.conf" sh -c 'echo "include \"/etc/nftables/openvpn.nft\"" >> /etc/nftables.conf'
+			run_cmd_fatal "Adding include to nftables.conf" sh -c 'echo "include \"/etc/nftables/openvpn.nft\"" >> /etc/nftables.conf'
 		fi
-
-		# Reload nftables to apply rules
-		run_cmd "Reloading nftables" systemctl reload nftables
+		run_cmd_fatal "Reloading nftables" systemctl reload nftables
 	else
 		# Use iptables for systems without firewalld or nftables
 		run_cmd_fatal "Creating iptables directory" mkdir -p /etc/iptables
 
-		# Script to add rules
-		echo "#!/bin/sh" >/etc/iptables/add-openvpn-rules.sh
+		# Dedicated chains enforce the same policy for userspace and DCO traffic.
+		{
+			echo "#!/bin/sh"
+			echo "set -eu"
+			echo "if iptables -nL OPENVPN_INSTALL_FORWARD >/dev/null 2>&1; then"
+			echo "  echo 'iptables chain OPENVPN_INSTALL_FORWARD already exists' >&2"
+			echo "  exit 1"
+			echo "fi"
+			if [[ $CLIENT_IPV6 == 'y' ]]; then
+				echo "if ip6tables -nL OPENVPN_INSTALL_FORWARD >/dev/null 2>&1; then"
+				echo "  echo 'ip6tables chain OPENVPN_INSTALL_FORWARD already exists' >&2"
+				echo "  exit 1"
+				echo "fi"
+			fi
+			echo "cleanup() { /etc/iptables/rm-openvpn-rules.sh >/dev/null 2>&1 || true; }"
+			echo "trap cleanup EXIT HUP INT TERM"
+		} >/etc/iptables/add-openvpn-rules.sh
+		{
+			echo "#!/bin/sh"
+			echo "set -u"
+			echo 'remove_rule() { "$@" 2>/dev/null || true; }'
+		} >/etc/iptables/rm-openvpn-rules.sh
 
-		# IPv4 rules (only if clients get IPv4)
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo "iptables -t nat -I POSTROUTING 1 -s $VPN_SUBNET_IPV4/24 -o $NIC -j MASQUERADE
-iptables -I INPUT 1 -i tun+ -s $VPN_SUBNET_IPV4/24 -j ACCEPT
-iptables -I FORWARD 1 -i tun+ -s $VPN_SUBNET_IPV4/24 -j ACCEPT
-iptables -I FORWARD 1 -o tun+ -d $VPN_SUBNET_IPV4/24 -j ACCEPT
-iptables -I INPUT 1 -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptables/add-openvpn-rules.sh
+		if [[ $ENDPOINT_TYPE == '4' ]]; then
+			echo "iptables -I INPUT 1 -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptables/add-openvpn-rules.sh
+			echo "remove_rule iptables -D INPUT -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptables/rm-openvpn-rules.sh
+		else
+			echo "ip6tables -I INPUT 1 -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptables/add-openvpn-rules.sh
+			echo "remove_rule ip6tables -D INPUT -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptables/rm-openvpn-rules.sh
 		fi
 
-		# IPv6 rules (only if clients get IPv6)
+		if [[ -n $VPN_SUBNET_IPV4 ]]; then
+			{
+				echo "iptables -N OPENVPN_INSTALL_FORWARD"
+				echo "iptables -I INPUT 1 -i tun+ -s $VPN_SUBNET_IPV4/24 -j ACCEPT"
+				echo "iptables -I FORWARD 1 -o tun+ -d $VPN_SUBNET_IPV4/24 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+				echo "iptables -I FORWARD 1 -i tun+ -s $VPN_SUBNET_IPV4/24 -j OPENVPN_INSTALL_FORWARD"
+				if [[ $CLIENT_IPV4 == 'y' ]]; then
+					while IFS= read -r local_network; do
+						echo "iptables -A OPENVPN_INSTALL_FORWARD -d $local_network -j ACCEPT"
+						echo "iptables -t nat -I POSTROUTING 1 -s $VPN_SUBNET_IPV4/24 -d $local_network -j MASQUERADE"
+					done < <(local_networks_for_family 4)
+				fi
+				if [[ $CLIENT_IPV4 == 'y' && $CLIENT_TO_CLIENT == 'y' ]]; then
+					echo "iptables -A OPENVPN_INSTALL_FORWARD -d $VPN_SUBNET_IPV4/24 -j ACCEPT"
+				fi
+				if [[ $CLIENT_IPV4 == 'y' && $ROUTE_INTERNET == 'y' ]]; then
+					for protected_network in "${PROTECTED_IPV4_NETWORKS[@]}"; do
+						echo "iptables -A OPENVPN_INSTALL_FORWARD -d $protected_network -j REJECT"
+					done
+					echo "iptables -A OPENVPN_INSTALL_FORWARD -j ACCEPT"
+					echo "iptables -t nat -I POSTROUTING 1 -s $VPN_SUBNET_IPV4/24 -o $NIC -j MASQUERADE"
+				else
+					echo "iptables -A OPENVPN_INSTALL_FORWARD -j REJECT"
+				fi
+			} >>/etc/iptables/add-openvpn-rules.sh
+
+			{
+				echo "remove_rule iptables -D FORWARD -i tun+ -s $VPN_SUBNET_IPV4/24 -j OPENVPN_INSTALL_FORWARD"
+				echo "remove_rule iptables -D FORWARD -o tun+ -d $VPN_SUBNET_IPV4/24 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+				echo "remove_rule iptables -D INPUT -i tun+ -s $VPN_SUBNET_IPV4/24 -j ACCEPT"
+				if [[ $CLIENT_IPV4 == 'y' && $ROUTE_INTERNET == 'y' ]]; then
+					echo "remove_rule iptables -t nat -D POSTROUTING -s $VPN_SUBNET_IPV4/24 -o $NIC -j MASQUERADE"
+				fi
+				if [[ $CLIENT_IPV4 == 'y' ]]; then
+					while IFS= read -r local_network; do
+						echo "remove_rule iptables -t nat -D POSTROUTING -s $VPN_SUBNET_IPV4/24 -d $local_network -j MASQUERADE"
+					done < <(local_networks_for_family 4)
+				fi
+				echo "remove_rule iptables -F OPENVPN_INSTALL_FORWARD"
+				echo "remove_rule iptables -X OPENVPN_INSTALL_FORWARD"
+			} >>/etc/iptables/rm-openvpn-rules.sh
+		fi
+
 		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo "ip6tables -t nat -I POSTROUTING 1 -s ${VPN_SUBNET_IPV6}/112 -o $NIC -j MASQUERADE
-ip6tables -I INPUT 1 -i tun+ -s ${VPN_SUBNET_IPV6}/112 -j ACCEPT
-ip6tables -I FORWARD 1 -i tun+ -s ${VPN_SUBNET_IPV6}/112 -j ACCEPT
-ip6tables -I FORWARD 1 -o tun+ -d ${VPN_SUBNET_IPV6}/112 -j ACCEPT
-ip6tables -I INPUT 1 -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptables/add-openvpn-rules.sh
+			{
+				echo "ip6tables -N OPENVPN_INSTALL_FORWARD"
+				echo "ip6tables -I INPUT 1 -i tun+ -s ${VPN_SUBNET_IPV6}/112 -j ACCEPT"
+				echo "ip6tables -I FORWARD 1 -o tun+ -d ${VPN_SUBNET_IPV6}/112 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+				echo "ip6tables -I FORWARD 1 -i tun+ -s ${VPN_SUBNET_IPV6}/112 -j OPENVPN_INSTALL_FORWARD"
+				while IFS= read -r local_network; do
+					echo "ip6tables -A OPENVPN_INSTALL_FORWARD -d $local_network -j ACCEPT"
+					echo "ip6tables -t nat -I POSTROUTING 1 -s ${VPN_SUBNET_IPV6}/112 -d $local_network -j MASQUERADE"
+				done < <(local_networks_for_family 6)
+				if [[ $CLIENT_TO_CLIENT == 'y' ]]; then
+					echo "ip6tables -A OPENVPN_INSTALL_FORWARD -d ${VPN_SUBNET_IPV6}/112 -j ACCEPT"
+				fi
+				if [[ $ROUTE_INTERNET == 'y' ]]; then
+					for protected_network in "${PROTECTED_IPV6_NETWORKS[@]}"; do
+						echo "ip6tables -A OPENVPN_INSTALL_FORWARD -d $protected_network -j REJECT"
+					done
+					echo "ip6tables -A OPENVPN_INSTALL_FORWARD -j ACCEPT"
+					echo "ip6tables -t nat -I POSTROUTING 1 -s ${VPN_SUBNET_IPV6}/112 -o $NIC -j MASQUERADE"
+				else
+					echo "ip6tables -A OPENVPN_INSTALL_FORWARD -j REJECT"
+				fi
+			} >>/etc/iptables/add-openvpn-rules.sh
+
+			{
+				echo "remove_rule ip6tables -D FORWARD -i tun+ -s ${VPN_SUBNET_IPV6}/112 -j OPENVPN_INSTALL_FORWARD"
+				echo "remove_rule ip6tables -D FORWARD -o tun+ -d ${VPN_SUBNET_IPV6}/112 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+				echo "remove_rule ip6tables -D INPUT -i tun+ -s ${VPN_SUBNET_IPV6}/112 -j ACCEPT"
+				if [[ $ROUTE_INTERNET == 'y' ]]; then
+					echo "remove_rule ip6tables -t nat -D POSTROUTING -s ${VPN_SUBNET_IPV6}/112 -o $NIC -j MASQUERADE"
+				fi
+				while IFS= read -r local_network; do
+					echo "remove_rule ip6tables -t nat -D POSTROUTING -s ${VPN_SUBNET_IPV6}/112 -d $local_network -j MASQUERADE"
+				done < <(local_networks_for_family 6)
+				echo "remove_rule ip6tables -F OPENVPN_INSTALL_FORWARD"
+				echo "remove_rule ip6tables -X OPENVPN_INSTALL_FORWARD"
+			} >>/etc/iptables/rm-openvpn-rules.sh
 		fi
 
-		# Script to remove rules
-		echo "#!/bin/sh" >/etc/iptables/rm-openvpn-rules.sh
-
-		# IPv4 removal rules
-		if [[ $CLIENT_IPV4 == 'y' ]]; then
-			echo "iptables -t nat -D POSTROUTING -s $VPN_SUBNET_IPV4/24 -o $NIC -j MASQUERADE
-iptables -D INPUT -i tun+ -s $VPN_SUBNET_IPV4/24 -j ACCEPT
-iptables -D FORWARD -i tun+ -s $VPN_SUBNET_IPV4/24 -j ACCEPT
-iptables -D FORWARD -o tun+ -d $VPN_SUBNET_IPV4/24 -j ACCEPT
-iptables -D INPUT -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptables/rm-openvpn-rules.sh
-		fi
-
-		# IPv6 removal rules
-		if [[ $CLIENT_IPV6 == 'y' ]]; then
-			echo "ip6tables -t nat -D POSTROUTING -s ${VPN_SUBNET_IPV6}/112 -o $NIC -j MASQUERADE
-ip6tables -D INPUT -i tun+ -s ${VPN_SUBNET_IPV6}/112 -j ACCEPT
-ip6tables -D FORWARD -i tun+ -s ${VPN_SUBNET_IPV6}/112 -j ACCEPT
-ip6tables -D FORWARD -o tun+ -d ${VPN_SUBNET_IPV6}/112 -j ACCEPT
-ip6tables -D INPUT -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptables/rm-openvpn-rules.sh
-		fi
+		echo "trap - EXIT HUP INT TERM" >>/etc/iptables/add-openvpn-rules.sh
 
 		run_cmd "Making add-openvpn-rules.sh executable" chmod +x /etc/iptables/add-openvpn-rules.sh
 		run_cmd "Making rm-openvpn-rules.sh executable" chmod +x /etc/iptables/rm-openvpn-rules.sh
@@ -3341,7 +3911,7 @@ WantedBy=multi-user.target" >/etc/systemd/system/iptables-openvpn.service
 		# Enable service and apply rules
 		run_cmd "Reloading systemd" systemctl daemon-reload
 		run_cmd "Enabling iptables service" systemctl enable iptables-openvpn
-		run_cmd "Starting iptables service" systemctl start iptables-openvpn
+		run_cmd_fatal "Starting iptables service" systemctl start iptables-openvpn
 	fi
 
 	# If the server is behind a NAT, use the correct IP address for the clients to connect to
@@ -4446,6 +5016,20 @@ function removeOpenVPN() {
 		# Extract IPv6 subnet (may be empty if IPv6 not enabled)
 		VPN_SUBNET_IPV6=$(grep '^server-ipv6 ' /etc/openvpn/server/server.conf | cut -d " " -f 2 | sed 's|/.*||')
 
+		local install_config=/etc/openvpn/server/openvpn-install.conf
+		local has_policy_manifest=n
+		if [[ -f $install_config ]]; then
+			has_policy_manifest=y
+			FIREWALL_BACKEND=$(grep '^FIREWALL_BACKEND=' "$install_config" | cut -d= -f2-)
+			ROUTE_INTERNET=$(grep '^ROUTE_INTERNET=' "$install_config" | cut -d= -f2-)
+			CLIENT_TO_CLIENT=$(grep '^CLIENT_TO_CLIENT=' "$install_config" | cut -d= -f2-)
+			LOCAL_NETWORKS=$(grep '^LOCAL_NETWORKS=' "$install_config" | cut -d= -f2-)
+			CLIENT_IPV4=$(grep '^CLIENT_IPV4=' "$install_config" | cut -d= -f2-)
+			CLIENT_IPV6=$(grep '^CLIENT_IPV6=' "$install_config" | cut -d= -f2-)
+			VPN_GATEWAY_IPV4="${VPN_SUBNET_IPV4%.*}.1"
+			VPN_GATEWAY_IPV6="${VPN_SUBNET_IPV6}1"
+		fi
+
 		# Stop OpenVPN
 		log_info "Stopping OpenVPN service..."
 		run_cmd "Disabling OpenVPN service" systemctl disable openvpn-server@server
@@ -4455,20 +5039,23 @@ function removeOpenVPN() {
 
 		# Remove firewall rules
 		log_info "Removing firewall rules..."
-		if systemctl is-active --quiet firewalld && firewall-cmd --list-ports | grep -q "$PORT/$PROTOCOL_BASE"; then
-			# firewalld was used
+		if systemctl is-active --quiet firewalld && { [[ $has_policy_manifest == 'y' && $FIREWALL_BACKEND == 'firewalld' ]] || { [[ $has_policy_manifest == 'n' ]] && firewall-cmd --list-ports | grep -q "$PORT/$PROTOCOL_BASE"; }; }; then
 			run_cmd "Removing OpenVPN port from firewalld" firewall-cmd --permanent --remove-port="$PORT/$PROTOCOL_BASE"
-			run_cmd "Removing masquerade from firewalld" firewall-cmd --permanent --remove-masquerade
-			# Remove IPv4 rich rule if configured
-			if [[ -n $VPN_SUBNET_IPV4 ]]; then
-				firewall-cmd --permanent --remove-rich-rule="rule family=\"ipv4\" source address=\"$VPN_SUBNET_IPV4/24\" accept" 2>/dev/null || true
-			fi
-			# Remove IPv6 rich rule if configured
-			if [[ -n $VPN_SUBNET_IPV6 ]]; then
-				firewall-cmd --permanent --remove-rich-rule="rule family=\"ipv6\" source address=\"${VPN_SUBNET_IPV6}/112\" accept" 2>/dev/null || true
+			if [[ $has_policy_manifest == 'y' ]]; then
+				firewall-cmd --permanent --delete-policy=openvpn-egress 2>/dev/null || true
+				firewall-cmd --permanent --delete-zone=openvpn-install 2>/dev/null || true
+			else
+				# Compatibility with installations created before policy manifests.
+				run_cmd "Removing masquerade from firewalld" firewall-cmd --permanent --remove-masquerade
+				if [[ -n $VPN_SUBNET_IPV4 ]]; then
+					firewall-cmd --permanent --remove-rich-rule="rule family=\"ipv4\" source address=\"$VPN_SUBNET_IPV4/24\" accept" 2>/dev/null || true
+				fi
+				if [[ -n $VPN_SUBNET_IPV6 ]]; then
+					firewall-cmd --permanent --remove-rich-rule="rule family=\"ipv6\" source address=\"${VPN_SUBNET_IPV6}/112\" accept" 2>/dev/null || true
+				fi
 			fi
 			run_cmd "Reloading firewalld" firewall-cmd --reload
-		elif [[ -f /etc/nftables/openvpn.nft ]]; then
+		elif [[ $has_policy_manifest == 'y' && $FIREWALL_BACKEND == 'nftables' && -f /etc/nftables/openvpn.nft ]] || [[ $has_policy_manifest == 'n' && -f /etc/nftables/openvpn.nft ]]; then
 			# nftables was used
 			# Delete tables (suppress errors in case tables don't exist)
 			nft delete table inet openvpn 2>/dev/null || true
@@ -4476,7 +5063,7 @@ function removeOpenVPN() {
 			nft delete table ip6 openvpn-nat 2>/dev/null || true
 			run_cmd "Removing include from nftables.conf" sed -i '/include.*openvpn\.nft/d' /etc/nftables.conf
 			run_cmd "Removing nftables rules file" rm -f /etc/nftables/openvpn.nft
-		elif [[ -f /etc/systemd/system/iptables-openvpn.service ]]; then
+		elif [[ $has_policy_manifest == 'y' && $FIREWALL_BACKEND == 'iptables' && -f /etc/systemd/system/iptables-openvpn.service ]] || [[ $has_policy_manifest == 'n' && -f /etc/systemd/system/iptables-openvpn.service ]]; then
 			# iptables was used
 			run_cmd "Stopping iptables service" systemctl stop iptables-openvpn
 			run_cmd "Disabling iptables service" systemctl disable iptables-openvpn
@@ -4599,4 +5186,6 @@ function manageMenu() {
 # =============================================================================
 # Main Entry Point
 # =============================================================================
-parse_args "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+	parse_args "$@"
+fi

@@ -19,7 +19,8 @@ RUN mkdir -p /dev/net
 
 # Copy test scripts
 COPY test/client-entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY test/policy-peer-entrypoint.sh /policy-peer-entrypoint.sh
+RUN chmod +x /entrypoint.sh /policy-peer-entrypoint.sh
 
 WORKDIR /etc/openvpn
 

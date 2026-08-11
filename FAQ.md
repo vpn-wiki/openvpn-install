@@ -87,7 +87,7 @@ down /usr/share/openvpn/contrib/pull-resolv-conf/client.down
 
 **Q:** What sysctl and firewall changes are made by the script?
 
-**A:** If firewalld is active, the script uses `firewall-cmd --permanent` to configure port, masquerade, and rich rules. Otherwise, iptables rules are saved at `/etc/iptables/add-openvpn-rules.sh` and `/etc/iptables/rm-openvpn-rules.sh`, managed by `/etc/systemd/system/iptables-openvpn.service`.
+**A:** If firewalld is active, the script uses `firewall-cmd --permanent` to configure scoped rich rules. If nftables is active, it creates `/etc/nftables/openvpn.nft`. Otherwise, iptables rules are saved at `/etc/iptables/add-openvpn-rules.sh` and `/etc/iptables/rm-openvpn-rules.sh`, managed by `/etc/systemd/system/iptables-openvpn.service`.
 
 Sysctl options are at `/etc/sysctl.d/99-openvpn.conf`
 
@@ -95,7 +95,13 @@ Sysctl options are at `/etc/sysctl.d/99-openvpn.conf`
 
 **Q:** How can I access other clients connected to the same OpenVPN server?
 
-**A:** Add `client-to-client` to your `server.conf`
+**A:** Enable client-to-client access during installation:
+
+```bash
+./openvpn-install.sh install --client-to-client
+```
+
+It is disabled by default. The installer configures both OpenVPN and the firewall so the policy also applies when Data Channel Offload (DCO) is active.
 
 ---
 
@@ -111,36 +117,19 @@ Sysctl options are at `/etc/sysctl.d/99-openvpn.conf`
 
 **Q:** How can I access computers on the OpenVPN server's LAN?
 
-**A:** Two steps are required:
+**A:** Specify the LAN during installation:
 
-1. **Push a route to clients** - Add the LAN subnet to `/etc/openvpn/server/server.conf`:
+```bash
+./openvpn-install.sh install --local-network 192.168.1.0/24
+```
 
-   ```
-   push "route 192.168.1.0 255.255.255.0"
-   ```
+Repeat `--local-network` to expose more than one server-side network. Using `--local-network` alone keeps the default full-tunnel internet routing enabled. Add `--no-route-internet` if only the selected server-side networks should use the VPN.
 
-   Replace `192.168.1.0/24` with your actual LAN subnet.
+This feature is mainly for OpenVPN servers installed at home. During interactive installation, enabling LAN access shows directly connected private networks as one editable, comma-separated list. Review the list because it can include cloud VPC or container networks. LAN access remains disabled by default, and non-interactive installation never detects networks automatically.
 
-2. **Enable routing back to VPN clients** - Choose one of these options:
-   - **Option A: Add a static route on your router** (recommended when you can configure your router)
+The installer pushes the route, permits only the selected destination, and adds destination-scoped NAT. LAN computers therefore see the connection as coming from the OpenVPN server and do not need a return route to the VPN subnet.
 
-     On your LAN router, add a route for the VPN subnet (default `10.8.0.0/24`) pointing to the OpenVPN server's LAN IP. This allows LAN devices to reply to VPN clients without NAT.
-
-   - **Option B: Masquerade VPN traffic to LAN**
-
-     If you can't modify your router, add a masquerade rule so VPN traffic appears to come from the server:
-
-     ```bash
-     # iptables
-     iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -d 192.168.1.0/24 -j MASQUERADE
-
-     # or nftables
-     nft add rule ip nat postrouting ip saddr 10.8.0.0/24 ip daddr 192.168.1.0/24 masquerade
-     ```
-
-     Make this persistent by adding it to your firewall scripts.
-
-Restart OpenVPN after making changes: `systemctl restart openvpn-server@server`
+Do not use a LAN CIDR that overlaps the VPN subnet. An overlap with the client's current LAN can also prevent the route from working.
 
 ---
 
@@ -181,56 +170,32 @@ To add password-protected clients:
 
 ---
 
-**Q:** For my clients - I want to set my internal network to pass through the VPN and the rest to go through my internet?
+**Q:** For my clients, how can I route only an internal network through the VPN?
 
-**A:** You would need to edit the `.ovpn` file. You can edit the template out of which those files are created by editing `/etc/openvpn/server/client-template.txt` file and adding
+**A:** Disable internet routing and specify the server-side network during installation:
 
-```sh
-route-nopull
-route 10.0.0.0 255.0.0.0
+```bash
+./openvpn-install.sh install \
+  --no-route-internet \
+  --local-network 10.0.0.0/8
 ```
 
-So for example - here it would route all traffic of `10.0.0.0/8` to the VPN. And the rest through the internet.
+The client's normal internet route and DNS remain unchanged.
 
 ---
 
-**Q:** How do I configure split-tunnel mode on the server (route only specific networks through VPN for all clients)?
+**Q:** How do I configure split-tunnel mode on the server?
 
-**A:** By default, the script configures full-tunnel mode where all client traffic goes through the VPN. To configure split-tunnel (only specific networks routed through VPN), edit `/etc/openvpn/server/server.conf`:
+**A:** Use `--no-route-internet`. Add each server-side network that should use the tunnel:
 
-1. Remove or comment out the redirect-gateway line:
+```bash
+./openvpn-install.sh install \
+  --no-route-internet \
+  --local-network 10.0.0.0/8 \
+  --local-network 192.168.1.0/24
+```
 
-   ```
-   #push "redirect-gateway def1 bypass-dhcp"
-   ```
-
-2. Add routes for the networks you want to tunnel:
-
-   ```
-   push "route 10.0.0.0 255.0.0.0"
-   push "route 192.168.1.0 255.255.255.0"
-   ```
-
-3. Optionally remove DNS push directives if you don't want VPN DNS:
-
-   ```
-   #push "dhcp-option DNS 1.1.1.1"
-   ```
-
-4. For IPv6, remove or comment out:
-
-   ```
-   #push "route-ipv6 2000::/3"
-   #push "redirect-gateway ipv6"
-   ```
-
-   Or add specific IPv6 routes:
-
-   ```
-   push "route-ipv6 2001:db8::/32"
-   ```
-
-5. Restart OpenVPN: `systemctl restart openvpn-server@server`
+The installer does not push internet routes, leak-blocking directives, or VPN DNS in this mode.
 
 ---
 
